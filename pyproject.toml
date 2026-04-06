@@ -1,0 +1,16 @@
+[project]
+name = "hockey-stats"
+version = "0.1.0"
+description = "Hockey analytics and visualization"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "requests",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
