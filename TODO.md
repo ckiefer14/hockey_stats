@@ -4,7 +4,7 @@ API
 
 
 ## To do:
-Pull in data for Avalanche only
+X: Pull in data for Avalanche only
 Start with SQLite and then move to SQLAlchemy/SQLModel once it works
 
 ## Planned Structure
@@ -15,6 +15,41 @@ Start with SQLite and then move to SQLAlchemy/SQLModel once it works
 
 ## Explanations
 pyproject.toml is the standard way Python projects declare themselves.
+
+Current structure:
+hockey-stats/
+├── pyproject.toml
+├── README.md
+├── TODO.md
+├── .gitignore
+├── .env.example
+│
+│
+├── config/
+│   ├── settings.py
+│   └── teams.py
+│
+├── data/
+│
+├── scripts/
+│   ├── load_games.py
+│   ├── load_teams.py
+│   └── test_boxscore.py
+│
+├── src/
+│   ├── __init__.py
+│   ├── models/
+│   │   └── schemas.py      
+│   └── data/
+│       ├── nhl_api.py
+│       └── db.py
+
+
+## Planned
+- visualization
+- Processing/analysis
+
+Shot location data and standings over time
 
 
 hockey-stats/
@@ -38,5 +73,3 @@ hockey-stats/
 │       └── db.py
 
 cache
-
-write scripts/load_teams.py
