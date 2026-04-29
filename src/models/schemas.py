@@ -21,6 +21,7 @@ class Team(BaseModel):
     conference: str
     conference_abbrev: str
     colors: TeamColors
+    team_id: Optional[int] = None
 
 
 class Player(BaseModel):
@@ -43,17 +44,17 @@ class Player(BaseModel):
 class Game(BaseModel):
     id: int
     season: int
-    game_type: int
+    game_type: int          # 1=preseason, 2=regular season, 3=playoffs
     game_date: str
     venue: str
     home_team_abbrev: str
     away_team_abbrev: str
     home_score: int
     away_score: int
-    home_sog: int
+    home_sog: int           # shots on goal
     away_sog: int
-    game_state: str
-    period_type: str # "REG","OT", "SO"
+    game_state: str         # "OFF" = final, "LIVE" = in progress, "FUT" = scheduled
+    period_type: str        # "REG", "OT", "SO"
 
 class SkaterGameStats(BaseModel):
     game_id: int
@@ -65,12 +66,12 @@ class SkaterGameStats(BaseModel):
     assists: int
     points: int
     plus_minus: int
-    pim: int
+    pim: int                    # penalties in minutes
     hits: int
     power_play_goals: int
-    sog: int
+    sog: int                    # shots on goal
     faceoff_winning_pctg: float
-    toi: str
+    toi: str                    # time on ice, formatted as "MM:SS"
     blocked_shots: int
     shifts: int
     giveaways: int
@@ -98,12 +99,38 @@ class ShotEvent(BaseModel):
     period: int
     period_type: str
     time_in_period: str
-    event_type: str          # "shot-on-goal", "goal", "missed-shot"
+    event_type: str                     # "shot-on-goal", "goal", "missed-shot"
     team_id: int
     shooting_player_id: Optional[int] = None
     goalie_id: Optional[int] = None
-    x_coord: float
+    x_coord: float                      # rink coordinates: center ice is (0, 0)
     y_coord: float
-    zone_code: str
-    shot_type: Optional[str] = None
-    reason: Optional[str] = None    # for missed shots: "wide-right", "high-and-wide", etc.
+    zone_code: str                      # "O"=offensive, "D"=defensive, "N"=neutral
+    shot_type: Optional[str] = None     # e.g. "wrist", "snap", "slap", "backhand"
+    reason: Optional[str] = None        # for missed shots: "wide-right", "high-and-wide", etc.
+    blocking_player_id: Optional[int] = None # for blocked shots
+
+class ScheduleGame(BaseModel):
+    game_id: int
+    season: int
+    game_type: int
+    game_date: date
+    home_team_abbrev: str
+    away_team_abbrev: str
+    game_state: str
+    home_team_id: int
+    away_team_id: int
+
+class Shift(BaseModel):
+    id: int
+    game_id: int
+    player_id: int
+    team_id: int
+    team_abbrev: str
+    first_name: str
+    last_name: str
+    period: int
+    shift_number: int
+    start_time: str
+    end_time: str
+    duration: Optional[str] = None

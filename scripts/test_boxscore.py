@@ -1,4 +1,5 @@
 # scripts/test_boxscore.py
+# Quick sanity check for fetch_boxscore — prints game summary, first 3 skaters, and all goalies.
 import sys
 sys.path.insert(0, ".")
 

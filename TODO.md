@@ -73,3 +73,41 @@ hockey-stats/
 │       └── db.py
 
 cache
+
+
+Stats:
+
+Corsi
+Fenwick
+PDO
+Expected Goals
+Goals saved above expected
+Game Score
+RAPM
+
+Predictive:
+
+###
+Corsi % = CF /  (CF + CA)
+
+CF = shots on goal for + missed shots for + blocked shots for
+
+CA = shots on goal against + missed shots against + blocked shots against
+
+
+Relative Corsi = (Player's on-ice Corsi) - (teams Corsi when off ice)
+
+CA/60 = CA*60
+
+###
+Fenwick FF/ (FF + FA)
+
+FF = shots on goal for + missed shots for
+###
+PDO = SH% + SV%
+
+###
+Gradient Boost for xGF
+
+GSAx = xGA - GA
+

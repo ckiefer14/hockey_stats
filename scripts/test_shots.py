@@ -1,4 +1,5 @@
 # scripts/test_shots.py
+# Quick sanity check for fetch_play_by_play — prints total shot events and previews the first 5.
 import sys
 sys.path.insert(0, ".")
 

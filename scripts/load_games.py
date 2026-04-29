@@ -2,9 +2,9 @@
 import sys
 sys.path.insert(0, ".")
 
-from src.data.nhl_api import fetch_schedule, fetch_boxscore
+from src.data.nhl_api import fetch_boxscore
 from src.data.db import (
-    get_connection, create_tables,
+    get_connection, create_tables, get_finished_game_ids,
     store_game, store_all_goalie_stats, store_all_skater_stats
 )
 '''
@@ -16,7 +16,7 @@ info along with skater and goalie stats in the database.
 conn = get_connection()
 create_tables(conn)
 
-game_ids = fetch_schedule("COL")
+game_ids = get_finished_game_ids(conn, "COL")
 print(f"Found {len(game_ids)} finished COL games")
 
 for i, game_id in enumerate(game_ids):

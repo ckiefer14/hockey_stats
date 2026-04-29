@@ -1,4 +1,6 @@
 # config/teams.py
+# Maps NHL team abbreviations to their official primary and secondary brand colors (hex).
+# Used when storing teams in the database since team colors aren't returned by the NHL API.
 
 TEAM_COLORS = {
     "ANA": {"primary": "#CF4520", "secondary": "#010101"},
@@ -37,8 +39,7 @@ TEAM_COLORS = {
 }
 
 def get_team_colors(abbreviation: str) -> dict:
-    """
-    Get team colors by abbreviation."""
+    """Get team colors by abbreviation. Falls back to black if team not found."""
     return TEAM_COLORS.get(abbreviation.upper(), {
         "primary": "#000000",
         "secondary": "#000000"

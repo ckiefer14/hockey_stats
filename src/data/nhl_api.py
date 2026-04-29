@@ -2,7 +2,9 @@
 import requests
 from config.settings import NHL_API_BASE_URL
 from config.teams import get_team_colors
-from src.models.schemas import Team, Player, Game, SkaterGameStats, GoalieGameStats, ShotEvent
+from src.models.schemas import (
+    Team, Player, Game, SkaterGameStats, 
+    GoalieGameStats, ShotEvent, ScheduleGame, Shift)
 
 from datetime import date
 
@@ -34,6 +36,7 @@ def fetch_teams() -> list[Team]:
             conference=entry["conferenceName"],
             conference_abbrev=entry["conferenceAbbrev"],
             colors=get_team_colors(entry["teamAbbrev"]["default"]),
+            team_id=entry.get("teamId"),
         ))
 
     return teams
@@ -49,10 +52,10 @@ def fetch_roster(team_abbrev: str) -> list[Player]:
 
     today = date.today()
 
-
     for group in ["forwards", "defensemen", "goalies"]:
         for entry in data[group]:
             birth = date.fromisoformat(entry['birthDate'])
+            # Subtract 1 if the birthday hasn't occurred yet this calendar year
             age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
             players.append(Player(
                 id=entry["id"],
@@ -158,23 +161,32 @@ def fetch_schedule(team_abbrev: str) -> list[int]:
     response.raise_for_status()
 
     data = response.json()
-    game_ids = []
+    games = []
 
     for game in data["games"]:
-        # Only grab regular season games that are finished
-        if game["gameType"] == 2 and game["gameState"] == "OFF":
-            game_ids.append(game["id"])
+        # Only grab regular season games
+        if game["gameType"] == 2:
+            games.append(ScheduleGame(
+            game_id=game["id"],
+            season=game["season"],
+            game_type=game["gameType"],
+            game_date=game["gameDate"],
+            home_team_abbrev=game["homeTeam"]["abbrev"],
+            away_team_abbrev=game["awayTeam"]["abbrev"],
+            game_state=game["gameState"],
+            home_team_id=game["homeTeam"]["id"],
+            away_team_id=game["awayTeam"]["id"],
+        ))
+    return games
 
-    return game_ids
-
-## 
+## Fetches play-by-play data for a game and filters to shot events only
 def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
     """Fetch shot events from play-by-play data for a single game."""
     response = requests.get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/play-by-play")
     response.raise_for_status()
 
     data = response.json()
-    shot_types = {"shot-on-goal", "goal", "missed-shot"}
+    shot_types = {"shot-on-goal", "goal", "missed-shot", "blocked-shot"}
     shots = []
 
     for play in data["plays"]:
@@ -202,6 +214,34 @@ def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
             zone_code=details["zoneCode"],
             shot_type=details.get("shotType"),
             reason=details.get("reason"),
+            blocking_player_id=details.get("blockingPlayerId"),
         ))
 
     return shots
+
+def fetch_shifts(game_id: int) -> list[Shift]:
+    """Fetch shift data for a single game."""
+    response = requests.get(f"https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={game_id}"
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    shifts = []
+
+    for entry in data["data"]:
+        shifts.append(Shift(
+            id=entry["id"],
+            game_id=entry["gameId"],
+            player_id=entry["playerId"],
+            team_id=entry["teamId"],
+            team_abbrev=entry["teamAbbrev"],
+            first_name=entry["firstName"],
+            last_name=entry["lastName"],
+            period=entry["period"],
+            shift_number=entry["shiftNumber"],
+            start_time=entry["startTime"],
+            end_time=entry["endTime"],
+            duration=entry["duration"],
+        ))
+
+    return shifts
