@@ -7,6 +7,8 @@ API
 X: Pull in data for Avalanche only
 Start with SQLite and then move to SQLAlchemy/SQLModel once it works
 
+All game events
+
 ## Planned Structure
 - `src/processing/` — Corsi, xG, game score, RAPM (coming later)
 - `src/viz/` — game summaries, player cards, heat maps (coming later)

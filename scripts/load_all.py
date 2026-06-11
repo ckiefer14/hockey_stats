@@ -9,61 +9,100 @@ from src.data.db import (
     store_teams, store_players,
     store_schedule, get_finished_game_ids,
     store_game, store_all_skater_stats, store_all_goalie_stats,
-    store_shot_events, store_shifts
+    store_shot_events, store_shifts, game_already_loaded
 )
 
-conn = get_connection()
-create_tables(conn)
+SEASONS = ["20212022","20222023","20232024","20242025","20252026"]
+# SEASONS_2026 = ["20252026"]
+FAILURE_LOG = "data_load_failures.log"
+SLEEP_BETWEEN_CALLS = 1.0
+SLEEP_AFTER_FAILURE = 3.0
 
-# 1. Teams
-teams = fetch_teams()
-store_teams(conn, teams)
-print(f"Stored {len(teams)} teams")
+def log_failure(msg: str) -> None:
+    print(msg)
+    with open(FAILURE_LOG, "a") as f:
+        f.write(f"{msg}\n")
 
-# 2. Rosters
-for team in teams:
-    players = fetch_roster(team.abbreviation)
-    store_players(conn, players)
-    print(f"  {team.abbreviation}: {len(players)} players")
+def main():
 
-# 3. Schedule
-schedule = fetch_schedule("COL")
-store_schedule(conn, schedule)
-print(f"Stored {len(schedule)} COL schedule entries")
+    conn = get_connection()
+    create_tables(conn)
 
-# 4. Populate team IDs
-populate_team_ids(conn)
-print("Populated team IDs")
+    # 1. Teams
+    teams = fetch_teams()
+    store_teams(conn, teams)
+    print(f"Stored {len(teams)} teams")
 
-# 5. Boxscores, shots, and shifts
-game_ids = get_finished_game_ids(conn, "COL")
-print(f"Loading {len(game_ids)} finished games...")
+    # 2. Rosters
+    for team in teams:
+        players = fetch_roster(team.abbreviation)
+        store_players(conn, players)
+        print(f"  {team.abbreviation}: {len(players)} players")
 
-for i, game_id in enumerate(game_ids):
-    try:
-        result = fetch_boxscore(game_id)
-        store_game(conn, result["game"])
-        store_all_skater_stats(conn, result["skaters"])
-        store_all_goalie_stats(conn, result["goalies"])
+    # 3. Schedule
+    for season in SEASONS:
+        for team in teams:
+            try:
+                schedule = fetch_schedule(team.abbreviation, season=season)
+                store_schedule(conn,schedule)
+                print(f"Stored {len(schedule)} {team.abbreviation} schedule entries")
+            except Exception as e:
+                log_failure(f"Schedule fetch failed for {team.abbreviation} {season}: {e}")
+            
+    # 4. Populate team IDs
+    populate_team_ids(conn)
+    print("Populated team IDs")
 
-        shots = fetch_play_by_play(game_id)
-        store_shot_events(conn, shots)
+    all_game_ids = set()
+
+    # 5. Collect unique game IDs across all teams (deduplicated)
+    for team in teams:
+        team_game_ids = get_finished_game_ids(conn, team.abbreviation)
+        all_game_ids.update(team_game_ids)
+    game_ids = sorted(all_game_ids)
+    print(f"Total unique finished games to process: {len(game_ids)}")
+
+    # 6. Per-game pull with resume + failure logging
+    skipped = 0
+    for i, game_id in enumerate(game_ids):
+        # Resume logic - slip if already loaded
+        if game_already_loaded(conn, game_id):
+            skipped += 1
+            continue
+
 
         try:
-            shifts = fetch_shifts(game_id)
-            store_shifts(conn, shifts)
-            shift_count = len(shifts)
-        except Exception:
-            shift_count = 0
+            result = fetch_boxscore(game_id)
+            store_game(conn, result["game"])
+            store_all_skater_stats(conn, result["skaters"])
+            store_all_goalie_stats(conn, result["goalies"])
 
-        print(f"  [{i+1}/{len(game_ids)}] {result['game'].away_team_abbrev} @ {result['game'].home_team_abbrev} - {result['game'].game_date} ({len(shots)} shots, {shift_count} shifts)")
+            shots = fetch_play_by_play(game_id)
+            store_shot_events(conn, shots)
 
-        # Pause to avoid rate limiting
-        time.sleep(1)
+            try:
+                shifts = fetch_shifts(game_id)
+                store_shifts(conn, shifts)
+                shift_count = len(shifts)
+            except Exception:
+                shift_count = 0
 
-    except Exception as e:
-        print(f"  [{i+1}/{len(game_ids)}] Game {game_id} FAILED: {e}")
-        time.sleep(3)
+            print(
+                f"  [{i+1}/{len(game_ids)}] "
+                f"{result['game'].away_team_abbrev} @ {result['game'].home_team_abbrev} - "
+                f"{result['game'].game_date} ({len(shots)} shots, {shift_count} shifts)"
+            )
 
-conn.close()
-print("Done!")
+            # Pause to avoid rate limiting
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+        except Exception as e:
+            log_failure(f"[{i+1}/{len(game_ids)}] Game {game_id} FAILED: {e}")
+            time.sleep(SLEEP_AFTER_FAILURE)
+
+    conn.close()
+    print(f"Done! Skipped {skipped} already-loaded games.")
+
+
+if __name__ == "__main__":
+    main()

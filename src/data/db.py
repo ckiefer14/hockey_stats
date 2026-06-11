@@ -8,6 +8,16 @@ from src.models.schemas import (Team, Player, Game, SkaterGameStats,
 This module contains functions for interacting with the SQLite database,
 including creating tables and inserting/updating data for teams, players, games, and stats.'''
 
+def game_already_loaded(conn, game_id:int) -> bool:
+    """Check if a game has already been loaded (game row + at least one shot event)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM games WHERE id = ? "
+        "AND EXISTS (SELECT 1 FROM shot_events WHERE game_id = ?) "
+        "LIMIT 1",
+        (game_id, game_id),
+    )
+    return cur.fetchone() is not None
 
 ## Database functions for SQLite. Uses SQLite for simplicity, but could be swapped out for something more robust if needed.
 def get_connection():
@@ -50,7 +60,7 @@ def create_tables(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY,
             first_name TEXT NOT NULL,
             last_name TEXT NOT NULL,
-            team_abbreviation TEST,
+            team_abbreviation TEXT,
             headshot TEXT,
             sweaterNumber INTEGER,
             shoots_catches TEXT,
@@ -103,7 +113,7 @@ def create_tables(conn: sqlite3.Connection):
             toi TEXT,
             blocked_shots INTEGER,
             shifts INTEGER,
-            giveways INTEGER,
+            giveaways INTEGER,
             takeaways INTEGER,
             PRIMARY KEY (game_id, player_id),
             FOREIGN KEY (game_id) REFERENCES games(id),
@@ -163,7 +173,7 @@ def create_tables(conn: sqlite3.Connection):
             game_state TEXT,
             home_team_id INTEGER,
             away_team_id INTEGER,
-            FOREIGN KEY (home_team_abbrev) REFERENCES teams(abbreviations),
+            FOREIGN KEY (home_team_abbrev) REFERENCES teams(abbreviation),
             FOREIGN KEY (away_team_abbrev) REFERENCES teams(abbreviation)
         )
     """)
@@ -391,7 +401,7 @@ def store_skater_stats(conn: sqlite3.Connection, stats: SkaterGameStats):
         INSERT OR REPLACE INTO skater_game_stats
            (game_id, player_id, team_abbreviation, name, position, goals, 
             assists, points, plus_minus, pim, hits, power_play_goals,
-            sog, faceoff_win_percentage, toi, blocked_shots, shifts, giveways,
+            sog, faceoff_win_percentage, toi, blocked_shots, shifts, giveaways,
             takeaways)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, ( 
@@ -498,6 +508,26 @@ def store_shot_events(conn: sqlite3.Connection, shots: list[ShotEvent]):
     for shot in shots:
         store_shot_event(conn, shot)
 
+def get_shots_for_game(conn: sqlite3.Connection, game_id: int) -> list[ShotEvent]:
+    """Load all shot events for a game as ShotEvent objects."""
+    rows = conn.execute("""
+        SELECT game_id, event_id, period, period_type, time_in_period,
+               event_type, team_id, shooting_player_id, goalie_id,
+               x_coord, y_coord, zone_code, shot_type, reason, blocking_player_id
+        FROM shot_events WHERE game_id = ?
+        ORDER BY period, time_in_period
+    """, (game_id,)).fetchall()
+
+    return [
+        ShotEvent(
+            game_id=row[0], event_id=row[1], period=row[2],
+            period_type=row[3], time_in_period=row[4], event_type=row[5],
+            team_id=row[6], shooting_player_id=row[7], goalie_id=row[8],
+            x_coord=row[9], y_coord=row[10], zone_code=row[11],
+            shot_type=row[12], reason=row[13], blocking_player_id=row[14],
+        )
+        for row in rows
+    ]
 ####################
 ##### Schedule functions
 ####################
@@ -522,6 +552,14 @@ def store_schedule_game(conn: sqlite3.Connection, game: ScheduleGame):
     ))
     conn.commit()
 
+def get_game_teams(conn, game_id: int):
+    """Returns (home_abbrev, away_abbrev, home_id, away_id) or None."""
+    row = conn.execute(
+        "SELECT home_team_abbrev, away_team_abbrev, home_team_id, away_team_id "
+        "FROM schedule WHERE game_id = ?",
+        (game_id,),
+    ).fetchone()
+    return row if row else None
 
 def store_schedule(conn: sqlite3.Connection, games: list[ScheduleGame]):
     """Insert or update a list of schedule entries."""
@@ -540,17 +578,38 @@ def get_finished_game_ids(conn: sqlite3.Connection, team_abbrev: str) -> list[in
     return [row[0] for row in rows]
 
 def get_team_id(conn: sqlite3.Connection, team_abbrev: str) -> int | None:
-    """Look up a team's numeric ID from the schedule data."""
+    """Look up a team's numeric ID from the teams table."""
+    row = conn.execute(
+        "SELECT team_id FROM teams WHERE abbreviation = ?",
+        (team_abbrev,),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def get_team_abbrevs_from_game_id(
+    conn: sqlite3.Connection,
+    game_id: int,
+) -> tuple[str, str] | None:
+    """Look up (home_abbrev, away_abbrev) for a game by id. Returns None if not found."""
+    row = conn.execute(
+        "SELECT home_team_abbrev, away_team_abbrev FROM schedule WHERE game_id = ?",
+        (game_id,),
+    ).fetchone()
+
+    if row is None:
+        return None
+    return row[0], row[1]
+
+def get_team_abbrev_from_team_id(conn: sqlite3.Connection, team_id: int) -> str | None:
+    """Look up a team's abbreviation from the team data."""
     row = conn.execute("""
-        SELECT home_team_id FROM schedule WHERE home_team_abbrev = ?
-        UNION
-        SELECT away_team_id FROM schedule WHERE away_team_abbrev = ?
-        LIMIT 1
-    """, (team_abbrev, team_abbrev)).fetchone()
+        SELECT abbreviation FROM teams WHERE team_id = ?
+    """, (team_id,)).fetchone()
 
     if row is None:
         return None
     return row[0]
+
 
 def populate_team_ids(conn: sqlite3.Connection):
     """Fill in team_id on the teams table using schedule data."""

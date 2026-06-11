@@ -153,11 +153,14 @@ def fetch_boxscore(game_id: int) -> dict:
     return {"game": game, "skaters": skaters, "goalies": goalies}
 
 ## Fetches the schedule for a team and returns a list of game IDs for finished regular season games
-def fetch_schedule(team_abbrev: str) -> list[int]:
+def fetch_schedule(team_abbrev: str, season: str | None = None) -> list[ScheduleGame]:
     """Fetch all game IDs for a team's current season."""
-    response = requests.get(
-        f"{NHL_API_BASE_URL}/v1/club-schedule-season/{team_abbrev}/now"
-    )
+    if season is None:
+        url = f"{NHL_API_BASE_URL}/v1/club-schedule-season/{team_abbrev}/now"
+    else:
+        url = f"{NHL_API_BASE_URL}/v1/club-schedule-season/{team_abbrev}/{season}"
+
+    response = requests.get(url)
     response.raise_for_status()
 
     data = response.json()
