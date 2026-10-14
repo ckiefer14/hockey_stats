@@ -2,7 +2,7 @@
 import sqlite3
 from config.settings import DB_PATH
 from src.models.schemas import (Team, Player, Game, SkaterGameStats, 
-                                GoalieGameStats, ShotEvent, ScheduleGame, Shift)
+                                GoalieGameStats, ShotEvent, ScheduleGame, Shift, GameEvent)
 
 '''
 This module contains functions for interacting with the SQLite database,
@@ -193,6 +193,32 @@ def create_tables(conn: sqlite3.Connection):
             duration TEXT,
             FOREIGN KEY (game_id) REFERENCES games(id)
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS game_events (
+            game_id INTEGER,
+            event_id INTEGER,
+            sort_order INTEGER,
+            period INTEGER,
+            period_type TEXT,
+            time_in_period TEXT,
+            game_seconds REAL,
+            event_type TEXT,
+            team_id INTEGER,
+            zone_code TEXT,
+            x_coord REAL,
+            y_coord REAL,
+            shot_type TEXT,
+            shooting_player_id INTEGER,
+            goalie_id INTEGER,
+            situation_code TEXT,
+            PRIMARY KEY (game_id, event_id),
+            FOREIGN KEY (game_id) REFERENCES games(id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_game_events_order
+        ON game_events (game_id, sort_order)
     """)
     conn.commit()
 
@@ -656,3 +682,51 @@ def store_shifts(conn: sqlite3.Connection, shifts: list[Shift]):
     for shift in shifts:
         store_shift(conn, shift)
 
+
+####################
+##### Game Event functions (full play-by-play, all event types)
+####################
+
+def store_game_events(conn: sqlite3.Connection, events: list[GameEvent]):
+    """Insert or update a game's full event list.
+
+    Batched (executemany + single commit) rather than per-row commits like
+    the other store functions: a season backfill writes ~2.3M rows, and
+    per-row commits would add hours of fsync overhead for no benefit.
+    """
+    conn.executemany("""
+        INSERT OR REPLACE INTO game_events
+        (game_id, event_id, sort_order, period, period_type, time_in_period,
+         game_seconds, event_type, team_id, zone_code, x_coord, y_coord,
+         shot_type, shooting_player_id, goalie_id, situation_code)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, [
+        (
+            e.game_id,
+            e.event_id,
+            e.sort_order,
+            e.period,
+            e.period_type,
+            e.time_in_period,
+            e.game_seconds,
+            e.event_type,
+            e.team_id,
+            e.zone_code,
+            e.x_coord,
+            e.y_coord,
+            e.shot_type,
+            e.shooting_player_id,
+            e.goalie_id,
+            e.situation_code,
+        )
+        for e in events
+    ])
+    conn.commit()
+
+
+def game_events_already_loaded(conn: sqlite3.Connection, game_id: int) -> bool:
+    """Check if full play-by-play events have been loaded for a game."""
+    cur = conn.execute(
+        "SELECT 1 FROM game_events WHERE game_id = ? LIMIT 1", (game_id,)
+    )
+    return cur.fetchone() is not None

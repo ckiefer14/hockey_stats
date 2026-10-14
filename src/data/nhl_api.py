@@ -3,8 +3,8 @@ import requests
 from config.settings import NHL_API_BASE_URL
 from config.teams import get_team_colors
 from src.models.schemas import (
-    Team, Player, Game, SkaterGameStats, 
-    GoalieGameStats, ShotEvent, ScheduleGame, Shift)
+    Team, Player, Game, SkaterGameStats,
+    GoalieGameStats, ShotEvent, GameEvent, ScheduleGame, Shift)
 
 from datetime import date
 
@@ -13,6 +13,11 @@ This module contains functions for fetching data from the NHL API,
 including team info, rosters, game boxscores, and schedules.
 The functions return Pydantic models defined in src/models/schemas.py
 for easy validation and parsing.
+
+Play-by-play is split into fetch (one HTTP call) + parse (two parsers over
+the same JSON): parse_shot_events keeps shot-type events only (existing
+shot_events pipeline), parse_game_events keeps EVERY event (needed for
+rebound/rush context derivation in src/processing/shot_context.py).
 '''
 
 ## Fetches team info from NHL API and returns a list of Team objects
@@ -182,13 +187,30 @@ def fetch_schedule(team_abbrev: str, season: str | None = None) -> list[Schedule
         ))
     return games
 
-## Fetches play-by-play data for a game and filters to shot events only
-def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
-    """Fetch shot events from play-by-play data for a single game."""
+####################
+##### Play-by-play: one fetch, two parsers
+####################
+
+def fetch_pbp_json(game_id: int) -> dict:
+    """Fetch the raw play-by-play JSON for a single game (one HTTP call).
+
+    Feed the result to parse_shot_events() and parse_game_events() so a
+    single download serves both the shot_events and game_events tables.
+    """
     response = requests.get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/play-by-play")
     response.raise_for_status()
+    return response.json()
 
-    data = response.json()
+
+def _time_in_period_to_seconds(mmss: str) -> int:
+    """Convert 'MM:SS' elapsed time to seconds."""
+    m, s = mmss.split(":")
+    return int(m) * 60 + int(s)
+
+
+def parse_shot_events(data: dict, game_id: int) -> list[ShotEvent]:
+    """Parse shot-type events from play-by-play JSON. (Unchanged filtering:
+    shot types only, rows without coordinates skipped.)"""
     shot_types = {"shot-on-goal", "goal", "missed-shot", "blocked-shot"}
     shots = []
 
@@ -210,7 +232,7 @@ def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
             time_in_period=play["timeInPeriod"],
             event_type=play["typeDescKey"],
             team_id=details["eventOwnerTeamId"],
-            shooting_player_id=details.get("shootingPlayerId"),
+            shooting_player_id=details.get("shootingPlayerId") or details.get("scoringPlayerId"),
             goalie_id=details.get("goalieInNetId"),
             x_coord=details["xCoord"],
             y_coord=details["yCoord"],
@@ -221,6 +243,52 @@ def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
         ))
 
     return shots
+
+
+def parse_game_events(data: dict, game_id: int) -> list[GameEvent]:
+    """Parse EVERY event from play-by-play JSON, regardless of type or
+    presence of coordinates. The raw, complete record for game_events."""
+    events = []
+
+    for play in data["plays"]:
+        details = play.get("details", {}) or {}
+        period = play["periodDescriptor"]["number"]
+        seconds = _time_in_period_to_seconds(play["timeInPeriod"])
+
+        events.append(GameEvent(
+            game_id=game_id,
+            event_id=play["eventId"],
+            sort_order=play["sortOrder"],
+            period=period,
+            period_type=play["periodDescriptor"]["periodType"],
+            time_in_period=play["timeInPeriod"],
+            game_seconds=(period - 1) * 1200 + seconds,
+            event_type=play["typeDescKey"],
+            team_id=details.get("eventOwnerTeamId"),
+            zone_code=details.get("zoneCode"),
+            x_coord=details.get("xCoord"),
+            y_coord=details.get("yCoord"),
+            shot_type=details.get("shotType"),
+            shooting_player_id=details.get("shootingPlayerId") or details.get("scoringPlayerId") or details.get("scoringPlayerId"),
+            goalie_id=details.get("goalieInNetId"),
+            situation_code=play.get("situationCode"),
+        ))
+
+    return events
+
+
+## Fetches play-by-play data for a game and filters to shot events only
+def fetch_play_by_play(game_id: int) -> list[ShotEvent]:
+    """Fetch shot events from play-by-play data for a single game.
+    (Kept for backwards compatibility — prefer fetch_pbp_json + parsers
+    when you need both shots and full events, to avoid a double fetch.)"""
+    return parse_shot_events(fetch_pbp_json(game_id), game_id)
+
+
+def fetch_game_events(game_id: int) -> list[GameEvent]:
+    """Fetch ALL events from play-by-play data for a single game."""
+    return parse_game_events(fetch_pbp_json(game_id), game_id)
+
 
 def fetch_shifts(game_id: int) -> list[Shift]:
     """Fetch shift data for a single game."""

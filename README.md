@@ -21,6 +21,21 @@ All of these come from the same underlying machinery — a hierarchical Bayesian
 
 ---
 
+## Status
+
+*Last updated: 2026-10-14*
+
+| Phase | Status | Result |
+|---|---|---|
+| 1. Data foundation | **Done** | 5 seasons (2021-22 to 2025-26), 6,560 games, full play-by-play, rebound/rush context validated |
+| 2. xG model | **Done** | LightGBM, test AUC 0.769, team-season xG correlates 0.97 with MoneyPuck |
+| 3. Team strength & goalie aggregates | **Next** | |
+| 4–8 | Not started | |
+
+**Check current state:** `py .\scripts\check_state.py` lists which files and tables exist and whether `shot_context` matches the current derivation code.
+
+---
+
 ## The Six-Step Arc
 
 The full pipeline, end-to-end:
@@ -80,7 +95,8 @@ hockey-stats/
 │   └── teams.py                # team metadata, colors, abbreviations
 │
 ├── data/                       # SQLite database lives here
-│   └── hockey_stats.db
+│   ├── hockey_stats.db
+│   └── external/               # files downloaded by hand (e.g. MoneyPuck teams.csv)
 │
 ├── src/
 │   │
@@ -93,6 +109,8 @@ hockey-stats/
 │   │
 │   ├── processing/             # raw data → analysis-ready
 │   │   ├── __init__.py
+│   │   ├── shot_context.py     # DONE: rebound / rush flags → shot_context table
+│   │   ├── xg_processing.py    # DONE: xG feature table, one row per shot
 │   │   ├── shots.py            # shot data processing
 │   │   ├── corsi.py            # Corsi/Fenwick calculations
 │   │   ├── game_score.py       # game score breakdown
@@ -107,7 +125,7 @@ hockey-stats/
 │   │   │
 │   │   ├── deterministic/
 │   │   │   ├── __init__.py
-│   │   │   ├── xg.py           # gradient-boosted xG model
+│   │   │   ├── xg.py           # DONE: ExpectedGoalsModel (LightGBM)
 │   │   │   └── rapm.py         # ridge regression RAPM (future)
 │   │   │
 │   │   └── stochastic/
@@ -132,7 +150,7 @@ hockey-stats/
 │   │
 │   ├── pipelines/              # NEW: high-level orchestration
 │   │   ├── __init__.py
-│   │   ├── train_xg.py         # fit xG model, pickle to disk
+│   │   ├── train_xg.py         # DONE: build features, train, evaluate, save
 │   │   ├── fit_hierarchical.py # fit PyMC model, save ArviZ NetCDF
 │   │   ├── fit_toy.py          # fit Track A toy MCMC for comparison
 │   │   ├── predict_game.py     # end-to-end single-game prediction
@@ -142,6 +160,7 @@ hockey-stats/
 │   ├── viz/                    # visualization (existing)
 │   │   ├── __init__.py
 │   │   ├── theme.py
+│   │   ├── rink_plot.py        # DONE: draw_rink, plot_game_events, plot_game
 │   │   ├── shot_heatmap.py
 │   │   ├── game_summary.py     # (future)
 │   │   ├── player_card.py      # (future)
@@ -151,13 +170,16 @@ hockey-stats/
 │       ├── __init__.py
 │       └── save.py
 │
-├── notebooks/                  # exploration
+├── notebooks/                  # exploration and checks
+│   ├── data_sanity.ipynb       # raw data checks (sections 1-13)
+│   ├── xg_features_check.ipynb # xG feature table checks
+│   └── xg_model_dev.ipynb      # baseline, LightGBM, evaluation, MoneyPuck comparison
 │
 ├── output/                     # generated images, posterior samples
 │   ├── game_summaries/
 │   ├── player_cards/
 │   ├── posteriors/             # NetCDF posterior samples
-│   └── models/                 # pickled trained models (xG)
+│   └── models/                 # pickled trained models (xG); keep out of git
 │
 ├── tests/
 │   ├── test_corsi.py
@@ -165,9 +187,15 @@ hockey-stats/
 │   └── fixtures/
 │
 └── scripts/                    # CLI entry points
-    ├── load_schedule.py
-    ├── load_games.py
-    └── load_shots.py
+    ├── load_all.py                   # teams, rosters, schedule, games, shots, events, shifts
+    ├── backfill_game_events.py       # one-time: full play-by-play for loaded games
+    ├── rebuild_shot_context.py       # re-derive shot_context after a code change
+    ├── check_state.py                # project state + shot_context sync check
+    ├── fix_goal_shooters.py          # one-time repair (goal scorer IDs)
+    ├── check_block_attribution.py    # diagnostic: who owns a blocked-shot event
+    ├── check_block_zone_frame.py     # diagnostic: which frame blocked-shot zones use
+    ├── nst_spotcheck.py              # compare rush/rebound counts with Natural Stat Trick
+    └── rush_event_audit.py           # list rush-flagged shots for one game
 ```
 
 ### Why Certain Things Live Where They Do
@@ -183,7 +211,23 @@ hockey-stats/
 **Two tracks under `stochastic/`** — `toy_mcmc.py` (Track A, your soil-pipeline port) and `hierarchical.py` (Track B, PyMC) coexist. Track A is the reference implementation; Track B is the production model. They share input contracts so the rest of the pipeline doesn't care which produced the samples.
 
 ---
-## Data Contract: Filtering Rules
+## Data Contract
+
+### Tables
+
+| Table | Rows | One row per | Notes |
+|---|---|---|---|
+| `shot_events` | 773,259 | shot attempt (incl. blocked, shootout) | Raw; filter at query time (below) |
+| `game_events` | 2,060,996 | play-by-play event of any type | Raw; ordered by `sort_order`, never `event_id` |
+| `shot_context` | 566,545 | unblocked, non-shootout shot | Derived from `game_events` by `shot_context.py` |
+| `shifts` | 4,578,542 | player shift | |
+| `games`, `schedule` | 6,560 | game | 1,312 per season × 5 |
+
+`shot_context` joins to `shot_events` on `(game_id, event_id)`. After any change to
+`src/processing/shot_context.py`, run `scripts/rebuild_shot_context.py`;
+`check_state.py` flags a stale table.
+
+### Filtering Rules
 
 `shot_events` is stored **raw and complete** — no filtering is applied at the
 database level. Shootout attempts (period 5) and blocked shots are all present.
@@ -196,13 +240,15 @@ applies the filters it needs at query time.
 2. `event_type IN ('shot-on-goal', 'goal', 'missed-shot')` — excludes
    blocked shots (degenerate coordinates) and shootout attempts.
 
-Together these yield **~565,000 clean unblocked non-shootout shots** — the xG
-training set (Phase 2).
+Together these yield **566,545 clean unblocked non-shootout shots**. The xG
+feature table then drops empty-net shots (opposing goalie digit = 0 in
+`situation_code`), leaving **562,374 training shots** (Phase 2).
 
 **Why this matters per consumer:**
 
-- **xG model (Phase 2):** apply both rules. Blocked shots lack a true shot
-  location and shootout attempts are mislabeled as goals; either would poison
+- **xG model (Phase 2):** apply both rules, then drop empty-net shots. Blocked
+  shots lack a true shot location, shootout attempts are mislabeled as goals,
+  and empty-net shots score regardless of geometry; any of them would poison
   training.
 - **Game model (Phase 6):** use `period <= 4` goals as the Poisson target so
   shootout-winner credits don't inflate goal counts. The shootout is modeled
@@ -215,6 +261,42 @@ are stored as `event_type` `'goal'` / `'shot-on-goal'` / `'missed-shot'`
 residuals after filtering are off-by-exactly-1 (the shootout-winner credit
 added to the official score with no corresponding real goal event), zero
 off-by-more-than-1 — fully characterized and expected, not a bug.
+
+### Known Data Quirks (verified against this database)
+
+- **Goal scorers:** the API stores the scorer under `scoringPlayerId`, not
+  `shootingPlayerId`. `parse_shot_events` reads both. 41,536 goals were repaired
+  once with `scripts/fix_goal_shooters.py`.
+- **Blocked-shot owner:** `eventOwnerTeamId` is the **shooting** team (90/10,
+  `check_block_attribution.py`).
+- **Blocked-shot zone:** `zoneCode` is written from the **defending** team's side
+  even though the owner is the shooter (99.9% of team-periods,
+  `check_block_zone_frame.py`). `shot_context.py` flips it before the rush rule.
+- **Zone codes** are relative to the event owner (O / N / D). Compare two events
+  only after translating both into the shooter's frame.
+- **`situation_code`** is 4 digits: away goalie, away skaters, home skaters, home
+  goalie (`1551` = 5v5). Decode from the shooter's point of view.
+- **Shot-type labels shifted in 2025-26** (many wrist → snap, deflected → tip-in).
+  The xG features group them as `wrist-snap` and `redirect`.
+- **Missing shot type** occurs almost only on goals; filling it with "unknown"
+  leaks the outcome. The xG features fill it with "wrist".
+- **Coordinates:** center ice is (0, 0), goal lines at x = ±89, blue lines at
+  x = ±25. Teams switch ends each period; normalize per game, period and team.
+
+### Rebound and Rush Definitions (`shot_context.py`)
+
+NST conventions, with the no-stoppage rule enforced (faceoffs, whistles,
+penalties and goals break the chain):
+
+- **Rebound:** unblocked shot within 3 s of a prior attempt by the same team.
+  9.4% of shots; converts at 12.4% vs 6.6% for other shots.
+- **Rush:** unblocked shot within 4 s of any event in the neutral zone or the
+  shooter's defensive zone. 2.7% of shots; weak as a yes/no flag (7.4% vs
+  7.1%), but strong when split by the previous event: takeaway 10.1%,
+  blocked shot 11.1%, giveaway 9.0%, hit 4.0%.
+- NST spot-check: 1 of 3 rush flags matched in game 2025020993. Both misses had
+  an opponent's shot as the precursor, at physically impossible 1–2 s gaps
+  (about 17% of rush flags, 0.5% of training data).
 
 ## Parallel Build: Track A vs Track B
 
@@ -283,25 +365,72 @@ When they disagree wildly, one of them is wrong, and you have a much better debu
 
 Realistic for a side project with focused sessions a few times a week. Roughly two months to a usable single-game predictor.
 
-### Phase 1 — Data Foundation (Weeks 1–2)
+### Phase 1 — Data Foundation (Weeks 1–2) — DONE
 
-- Expand `scripts/load_shots.py` to iterate over the full league schedule, not just COL. Run overnight.
-- Verify shot data integrity: row counts, NULL rates, distribution of shot coordinates, presence of all 32 teams.
-- Confirm play-by-play covers at least one full season; ideally backfill 2–3 seasons.
+- ~~Expand `scripts/load_shots.py` to iterate over the full league schedule.~~ Done as `scripts/load_all.py`: all 32 teams, 5 seasons.
+- ~~Verify shot data integrity.~~ `notebooks/data_sanity.ipynb`, sections 1–13, all passing.
+- ~~Backfill 2–3 seasons.~~ 2021-22 through 2025-26 (6,560 games).
 
-**Blocker for everything downstream.** Don't start Phase 2 until this is solid.
+**Added beyond the original plan:**
+- `game_events` table (full play-by-play, every event type), needed for rush detection.
+- `shot_context` table with rebound / rush flags, prior event type and time since prior event.
+- Fixes found by the checks: goal-shooter repair, blocked-shot zone frame, no-stoppage rule (see Data Contract → Known Data Quirks).
+- External check against Natural Stat Trick (`scripts/nst_spotcheck.py`, `scripts/rush_event_audit.py`).
 
-### Phase 2 — xG Model (Week 3)
+### Phase 2 — xG Model (Week 3) — DONE
 
-- Write `src/models/deterministic/xg.py`. Class with `.fit()`, `.predict_proba()`, `.save()`, `.load()`.
-- Features: distance, angle, shot type, rebound flag, rush flag, strength state, prior event type, time since prior event.
-- Model: LightGBM or XGBoost with log-loss objective.
-- Temporal train/test split (no random shuffle — leaks future info into past).
-- Validate per-game team xG totals against MoneyPuck on held-out games. Target $r > 0.9$.
-- Pickle the trained model with version stamp: `xg_lgbm_v1_2024-2025.pkl`.
+**Files:**
+- `src/processing/xg_processing.py` — `build_xg_features(conn)`: one row per shot, 13 features
+- `src/models/deterministic/xg.py` — `ExpectedGoalsModel` with `.fit()`, `.predict()`, `.evaluate()`, `.calibration()`, `.feature_importance()`, `.save()`, `.load()`
+- `src/pipelines/train_xg.py` — run with `py -m src.pipelines.train_xg [--final]`
+- `notebooks/xg_features_check.ipynb`, `notebooks/xg_model_dev.ipynb`
 
-### Phase 3 — Team Strength & Goalie Aggregates (Week 4)
+**Features (13):** distance, angle, shot type (grouped), rebound flag, rush flag,
+previous event type, time since previous event, skater difference, total skaters,
+own goalie pulled, distance from previous event, speed from previous event,
+rebound angle change.
 
+**Model:** LightGBM, log-loss objective. `num_leaves=31`, `min_child_samples=200`,
+`learning_rate=0.03`, `subsample=0.8`, `colsample_bytree=0.8`. A 9-combination grid
+search found no better setting (top six within 0.00005 log loss; 63 leaves worse).
+
+**Season roles:** train 2021-22 to 2023-24, validate 2024-25 (early stopping picks
+387 trees), then refit on 2021-22 to 2024-25 and test once on 2025-26.
+Recency weights 1.0 / 1.25 / 1.5 / 2.0, oldest to newest.
+
+**Results on the 2025-26 test season:**
+
+| | Baseline (distance + angle, logistic) | Final LightGBM |
+|---|---|---|
+| AUC | 0.714 | **0.769** |
+| Log loss | 0.2307 | **0.2168** |
+| Predicted vs actual goals | +1.4% | +2.4% (7,763 vs 7,578) |
+| Calibration | Mid-range under, top over | Within 0.8 points in every decile |
+
+What moved the score, in order: LightGBM over logistic regression; previous-event
+features; recency weighting; shot-type grouping (fixed the goal total).
+
+**MoneyPuck comparison (2025-26, 5-on-5, team-season totals, 32 teams):**
+xGF r = 0.970, xGA r = 0.940, total xG ratio 1.000. MoneyPuck blocks scripted
+downloads; save `teams.csv` by hand to `data/external/`.
+
+**Saved models (`output/models/`):**
+- `xg_lgbm_20212022_20242025.pkl` + `_metrics.json` — the evaluated model
+- `xg_lgbm_live.pkl` — same settings, trained on all five seasons, for scoring new games
+
+**Gaps against the original plan:**
+- MoneyPuck validation was done on team-season totals, not per-game totals. Per-game is stricter and still to do.
+- No version number in the file name and no config entry pointing to the active model.
+- Random seed and library versions are not yet saved with the model.
+- Method is named `.predict()`, not `.predict_proba()`.
+
+### Phase 3 — Team Strength & Goalie Aggregates (Week 4) — NEXT
+
+- **First:** score every shot with the xG model and store the result in a
+  `shot_xg` table. Team xGF/60 and goalie GSAx are sums over that table. Score
+  each season with a model that did not train on it (walk-forward), or past
+  teams' xG is flattered by a model that has seen their games. `shot_events`
+  already stores `goalie_id` for GSAx.
 - `src/processing/team_strength.py`: rolling 25-game windows of xGF/60 and xGA/60 per team.
 - `src/models/stochastic/goalie.py`: simple Bayesian goalie rating. Beta-Binomial on save proportion, or Normal-Normal on GSAx/60. No hierarchy yet — that comes in Track B.
 - Both produce: point estimate + variance for each team / goalie at any point in the season.
@@ -381,7 +510,7 @@ Sobol analysis at the end ranks which of these matter most for which outcomes.
 
 ## Persistence & Reproducibility
 
-- **xG model:** pickle with version stamp under `output/models/`. Config entry points to active version.
+- **xG model:** pickle under `output/models/` (`train_xg.py` writes the model and a `_metrics.json`). Still to add: version number and a config entry pointing to the active version.
 - **Posterior samples:** ArviZ NetCDF under `output/posteriors/`. Both tracks write to the same format so downstream code is sampler-agnostic.
 - **PCE surrogate:** pickle with input-range metadata and coefficient array.
 - **Backtest results:** CSV under `output/backtests/` with one row per held-out game (date, teams, prediction, outcome, log-loss contribution).
@@ -404,6 +533,15 @@ These are real decisions but premature to make now:
 - **Score effects, rest, travel, back-to-backs.** Real factors, but adding them prematurely complicates the base model. Document as v2 features.
 - **Player-level point distributions.** Requires shift-level data and per-player rate modeling. Defer until team-level pipeline is calibrated.
 
+**Data and xG items found in Phases 1–2:**
+
+- **Redirect location drift.** Each season, redirects are recorded closer to the net (share under 10 ft: 24.8% in 2021-22 → 38.2% in 2025-26) while their goal rate falls (9.4% → 7.5%). The model overrates 2025-26 redirects by about 24%, and this accounts for most of the +2.4% total bias. Recency weighting helps only slightly. Retrain every season.
+- **Arena recording bias.** Some rinks log shot locations closer or farther than others. MoneyPuck adjusts for it; this model does not. v2 refinement.
+- **Timestamp artifacts.** The feed logs whole seconds, so an opponent's shot can appear 1–2 s before a shot at the other net. Affects about 0.5% of shots.
+- **NST rush definition.** NST appears not to count an opponent's shot as a rush precursor. Unconfirmed at three events; a query-time filter gives NST parity if needed.
+- **Rebound and rush windows.** 3 s and 4 s are NST conventions, not fitted. Test 2/3/4 s by retraining and comparing validation log loss.
+- **Previous-event location for stoppage-type events** is missing for about 0.5% of shots.
+
 ---
 
 ## Decisions Made
@@ -416,6 +554,18 @@ For future reference, the decisions locked in during planning:
 - **Build strategy:** Track A (AM MCMC) and Track B (PyMC) in parallel. Track A as integration test and reference; Track B as production.
 - **Uncertainty sources to track:** all three (aleatoric, parameter, model misspec); rank with Sobol later, no pre-ranking.
 - **Folder structure:** add `analysis/`, `validation/`, `pipelines/` as new top-level under `src/`. `game_model.py` at top level of `models/`.
+
+Decided during Phases 1–2:
+
+- **Raw tables stay raw.** Derived flags live in `shot_context`; filters are applied at query time.
+- **xG training set:** unblocked shots, `period <= 4`, empty nets dropped.
+- **Season roles:** test = `CURRENT_SEASON`, validation = `LAST_SEASON` (both in `config/settings.py`); the test season is graded once per change, never used to choose settings.
+- **Rush in the model:** feed `last_event_type` and `time_since_last_event`; keep `is_rush` for reporting.
+- **Strength state:** decoded shooter-relative (skater difference, total skaters, own goalie pulled), not the raw code.
+- **Shot types grouped** into `wrist-snap` and `redirect` because the labels changed between seasons.
+- **Recency weighting on** (1.0 / 1.25 / 1.5 / 2.0).
+- **No recalibration step:** the remaining bias is concentrated in redirects, so a uniform shift would worsen other shot types.
+- **Trained `.pkl` files stay out of git;** rebuild with `train_xg.py`.
 
 ---
 
@@ -444,5 +594,17 @@ For future reference, the decisions locked in during planning:
 **ArviZ** — Python library for Bayesian model diagnostics and storage. NetCDF-based `InferenceData` is the standard format.
 
 **Walk-forward backtest** — Validation strategy where, for each held-out game in chronological order, models are refit using only prior data. Avoids look-ahead bias.
+
+**AUC** — Area under the ROC curve. The chance the model gives a random goal a higher xG than a random non-goal. 0.5 is guessing; public xG models land around 0.75–0.80.
+
+**Log loss** — How far predicted probabilities are from what happened. Lower is better; a proper scoring rule.
+
+**Calibration** — Whether predicted probabilities match observed rates: shots given 10% should score about 10% of the time.
+
+**Gradient boosting** — Many small decision trees built in sequence, each correcting the previous ones' errors (LightGBM, XGBoost). Contrast with a random forest, which averages independently built trees.
+
+**Early stopping** — Stop adding trees once the validation score stops improving, to avoid overfitting.
+
+**Recency weighting** — Counting recent seasons more in training so the model follows current recording habits.
 
 **Proper scoring rules** — Loss functions for probabilistic predictions that are minimized in expectation by the true distribution. Log-loss, Brier, CRPS are proper. RMSE on probabilities is not.

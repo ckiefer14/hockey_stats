@@ -110,6 +110,31 @@ class ShotEvent(BaseModel):
     reason: Optional[str] = None        # for missed shots: "wide-right", "high-and-wide", etc.
     blocking_player_id: Optional[int] = None # for blocked shots
 
+class GameEvent(BaseModel):
+    """One play-by-play event of ANY type (faceoff, hit, takeaway, shot, ...).
+
+    The full event stream backs the shot-context derivation (rebound/rush):
+    rush detection needs the non-shot events immediately preceding a shot.
+    Joins to ShotEvent on (game_id, event_id); chronological order comes
+    from sort_order, since the API's eventId is NOT in play order.
+    """
+    game_id: int
+    event_id: int                       # API eventId — join key to shot_events
+    sort_order: int                     # API sortOrder — chronological ordering
+    period: int
+    period_type: str                    # "REG", "OT", "SO"
+    time_in_period: str                 # "MM:SS", counts up
+    game_seconds: float                 # (period-1)*1200 + seconds elapsed in period
+    event_type: str                     # typeDescKey: "hit", "faceoff", "shot-on-goal", ...
+    team_id: Optional[int] = None       # eventOwnerTeamId; None for stoppages etc.
+    zone_code: Optional[str] = None     # O/N/D relative to event owner; None when absent
+    x_coord: Optional[float] = None
+    y_coord: Optional[float] = None
+    shot_type: Optional[str] = None
+    shooting_player_id: Optional[int] = None
+    goalie_id: Optional[int] = None
+    situation_code: Optional[str] = None  # strength state encoding, e.g. "1551"
+
 class ScheduleGame(BaseModel):
     game_id: int
     season: int

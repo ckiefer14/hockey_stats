@@ -1,9 +1,36 @@
 # Database Schema
 
-_Auto-generated from the live database on 2026-05-30 10:25._
+_Auto-generated from the live database on 2026-10-14 10:25._
 _Regenerate with `python scripts/generate_schema_doc.py`._
 
-**8 tables.**
+**10 tables.**
+
+## `game_events`
+
+2,060,996 rows.
+
+| Column | Type | Primary Key | Not Null |
+|---|---|---|---|
+| `game_id` | INTEGER | ✓ |  |
+| `event_id` | INTEGER | ✓ |  |
+| `sort_order` | INTEGER |  |  |
+| `period` | INTEGER |  |  |
+| `period_type` | TEXT |  |  |
+| `time_in_period` | TEXT |  |  |
+| `game_seconds` | REAL |  |  |
+| `event_type` | TEXT |  |  |
+| `team_id` | INTEGER |  |  |
+| `zone_code` | TEXT |  |  |
+| `x_coord` | REAL |  |  |
+| `y_coord` | REAL |  |  |
+| `shot_type` | TEXT |  |  |
+| `shooting_player_id` | INTEGER |  |  |
+| `goalie_id` | INTEGER |  |  |
+| `situation_code` | TEXT |  |  |
+
+**Foreign keys:**
+
+- `game_id` → `games.id`
 
 ## `games`
 
@@ -121,6 +148,24 @@ _Regenerate with `python scripts/generate_schema_doc.py`._
 | `start_time` | TEXT |  |  |
 | `end_time` | TEXT |  |  |
 | `duration` | TEXT |  |  |
+
+**Foreign keys:**
+
+- `game_id` → `games.id`
+
+## `shot_context`
+
+566,545 rows.
+
+| Column | Type | Primary Key | Not Null |
+|---|---|---|---|
+| `game_id` | INTEGER | ✓ |  |
+| `event_id` | INTEGER | ✓ |  |
+| `is_rebound` | INTEGER |  |  |
+| `is_rush` | INTEGER |  |  |
+| `time_since_last_event` | REAL |  |  |
+| `last_event_type` | TEXT |  |  |
+| `last_event_zone` | TEXT |  |  |
 
 **Foreign keys:**
 

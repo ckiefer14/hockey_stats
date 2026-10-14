@@ -3,14 +3,18 @@ import sys
 import time
 sys.path.insert(0, ".")
 
-from src.data.nhl_api import fetch_teams, fetch_roster, fetch_schedule, fetch_boxscore, fetch_play_by_play, fetch_shifts
+from src.data.nhl_api import (
+    fetch_teams, fetch_roster, fetch_schedule, fetch_boxscore,
+    fetch_pbp_json, parse_shot_events, parse_game_events, fetch_shifts
+)
 from src.data.db import (
     get_connection, create_tables, populate_team_ids,
     store_teams, store_players,
     store_schedule, get_finished_game_ids,
     store_game, store_all_skater_stats, store_all_goalie_stats,
-    store_shot_events, store_shifts, game_already_loaded
+    store_shot_events, store_game_events, store_shifts, game_already_loaded
 )
+from src.processing.shot_context import build_shot_context
 
 SEASONS = ["20212022","20222023","20232024","20242025","20252026"]
 # SEASONS_2026 = ["20252026"]
@@ -65,7 +69,7 @@ def main():
     # 6. Per-game pull with resume + failure logging
     skipped = 0
     for i, game_id in enumerate(game_ids):
-        # Resume logic - slip if already loaded
+        # Resume logic - skip if already loaded
         if game_already_loaded(conn, game_id):
             skipped += 1
             continue
@@ -77,8 +81,13 @@ def main():
             store_all_skater_stats(conn, result["skaters"])
             store_all_goalie_stats(conn, result["goalies"])
 
-            shots = fetch_play_by_play(game_id)
+            # One PBP fetch feeds both tables: shot_events (shot types only)
+            # and game_events (every event — needed for rebound/rush context)
+            pbp = fetch_pbp_json(game_id)
+            shots = parse_shot_events(pbp, game_id)
             store_shot_events(conn, shots)
+            events = parse_game_events(pbp, game_id)
+            store_game_events(conn, events)
 
             try:
                 shifts = fetch_shifts(game_id)
@@ -90,7 +99,7 @@ def main():
             print(
                 f"  [{i+1}/{len(game_ids)}] "
                 f"{result['game'].away_team_abbrev} @ {result['game'].home_team_abbrev} - "
-                f"{result['game'].game_date} ({len(shots)} shots, {shift_count} shifts)"
+                f"{result['game'].game_date} ({len(shots)} shots, {len(events)} events, {shift_count} shifts)"
             )
 
             # Pause to avoid rate limiting
@@ -99,6 +108,12 @@ def main():
         except Exception as e:
             log_failure(f"[{i+1}/{len(game_ids)}] Game {game_id} FAILED: {e}")
             time.sleep(SLEEP_AFTER_FAILURE)
+
+    # 7. Derive shot context (rebound / rush flags) for any new games.
+    # Processing step, kept out of the per-game acquisition loop on purpose.
+    print("Deriving shot context (rebound / rush flags)...")
+    n = build_shot_context(conn)
+    print(f"Wrote {n} shot_context rows.")
 
     conn.close()
     print(f"Done! Skipped {skipped} already-loaded games.")

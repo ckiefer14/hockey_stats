@@ -1,3 +1,9 @@
+## References:
+https://www.naturalstattrick.com/glossary.php?players=
+
+https://moneypuck.com/data.htm
+
+
 SQLite
 Pydantic
 API
@@ -113,3 +119,7 @@ Gradient Boost for xGF
 
 GSAx = xGA - GA
 
+
+
+
+PHASE 2: Do XG
