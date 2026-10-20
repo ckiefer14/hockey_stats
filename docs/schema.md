@@ -1,9 +1,9 @@
 # Database Schema
 
-_Auto-generated from the live database on 2026-10-14 10:25._
+_Auto-generated from the live database on 2026-10-19 18:57._
 _Regenerate with `python scripts/generate_schema_doc.py`._
 
-**10 tables.**
+**11 tables.**
 
 ## `game_events`
 
@@ -192,6 +192,23 @@ _Regenerate with `python scripts/generate_schema_doc.py`._
 | `shot_type` | TEXT |  |  |
 | `reason` | TEXT |  |  |
 | `blocking_player_id` | INTEGER |  |  |
+
+**Foreign keys:**
+
+- `game_id` → `games.id`
+
+## `shot_xg`
+
+562,374 rows.
+
+| Column | Type | Primary Key | Not Null |
+|---|---|---|---|
+| `game_id` | INTEGER | ✓ |  |
+| `event_id` | INTEGER | ✓ |  |
+| `season` | INTEGER |  |  |
+| `xg` | REAL |  |  |
+| `model_version` | TEXT |  |  |
+| `scored_by` | TEXT |  |  |
 
 **Foreign keys:**
 

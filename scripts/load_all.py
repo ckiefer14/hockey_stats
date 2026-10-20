@@ -14,10 +14,9 @@ from src.data.db import (
     store_game, store_all_skater_stats, store_all_goalie_stats,
     store_shot_events, store_game_events, store_shifts, game_already_loaded
 )
+from config.settings import SEASONS
 from src.processing.shot_context import build_shot_context
 
-SEASONS = ["20212022","20222023","20232024","20242025","20252026"]
-# SEASONS_2026 = ["20252026"]
 FAILURE_LOG = "data_load_failures.log"
 SLEEP_BETWEEN_CALLS = 1.0
 SLEEP_AFTER_FAILURE = 3.0

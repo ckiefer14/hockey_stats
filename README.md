@@ -23,14 +23,16 @@ All of these come from the same underlying machinery — a hierarchical Bayesian
 
 ## Status
 
-*Last updated: 2026-10-14*
+*Last updated: 2026-10-18*
 
 | Phase | Status | Result |
 |---|---|---|
 | 1. Data foundation | **Done** | 5 seasons (2021-22 to 2025-26), 6,560 games, full play-by-play, rebound/rush context validated |
 | 2. xG model | **Done** | LightGBM, test AUC 0.769, team-season xG correlates 0.97 with MoneyPuck |
-| 3. Team strength & goalie aggregates | **Next** | |
-| 4–8 | Not started | |
+| 3. Team strength & goalie aggregates | **Done** | Rolling 25-game xG team strength picks winners 59% of the time; Bayesian goalie rating (k = 800, season-adjusted) |
+| 4. Track A toy MCMC | **Next** | |
+| 5–8 | Not started | |
+| v2. Model improvements | Planned (after Phase 7) | Hierarchical xG layer, lineup (player-level) model — see *v2 — Planned Improvements* |
 
 **Check current state:** `py .\scripts\check_state.py` lists which files and tables exist and whether `shot_context` matches the current derivation code.
 
@@ -114,9 +116,10 @@ hockey-stats/
 │   │   ├── shots.py            # shot data processing
 │   │   ├── corsi.py            # Corsi/Fenwick calculations
 │   │   ├── game_score.py       # game score breakdown
-│   │   ├── team_strength.py    # rolling xGF/60, xGA/60 aggregates
+│   │   ├── team_strength.py    # DONE: team_game_xg, rolling_strength, strength_as_of
+│   │   ├── stints.py           # v2: shifts → stints (constant on-ice sets)
 │   │   ├── rapm.py             # RAPM / WAR (future)
-│   │   └── goalie.py           # goalie statistics
+│   │   └── goalie.py           # DONE: goalie_game_xg (per-goalie, per-game xGA / GA)
 │   │
 │   ├── models/
 │   │   ├── __init__.py
@@ -131,9 +134,11 @@ hockey-stats/
 │   │   └── stochastic/
 │   │       ├── __init__.py
 │   │       ├── am_sampler.py   # Adaptive Metropolis (ported from soil)
-│   │       ├── goalie.py       # Bayesian goalie rating (simple conjugate)
+│   │       ├── goalie.py       # DONE: goalie_rating_as_of (Gamma-Poisson, season-adjusted)
 │   │       ├── toy_mcmc.py     # Track A: hockey-flavored AM MCMC
 │   │       ├── hierarchical.py # Track B: PyMC hierarchical model
+│   │       ├── xg_hierarchical.py # v2: Bayesian layer on top of LightGBM xG
+│   │       ├── lineup_rapm.py  # v2: Bayesian RAPM player effects
 │   │       ├── montecarlo.py   # Monte Carlo over posterior samples
 │   │       └── pce.py          # PCE surrogate for Sobol analysis
 │   │
@@ -151,8 +156,11 @@ hockey-stats/
 │   ├── pipelines/              # NEW: high-level orchestration
 │   │   ├── __init__.py
 │   │   ├── train_xg.py         # DONE: build features, train, evaluate, save
+│   │   ├── score_xg.py         # DONE: score every shot into shot_xg (leave-one-season-out)
 │   │   ├── fit_hierarchical.py # fit PyMC model, save ArviZ NetCDF
 │   │   ├── fit_toy.py          # fit Track A toy MCMC for comparison
+│   │   ├── fit_xg_layer.py     # v2: fit hierarchical xG layer, save NetCDF
+│   │   ├── fit_lineup.py       # v2: build stints, fit RAPM, save NetCDF
 │   │   ├── predict_game.py     # end-to-end single-game prediction
 │   │   ├── backtest_season.py  # run validation harness on held-out games
 │   │   └── build_pce.py        # fit PCE surrogate for Sobol
@@ -173,7 +181,8 @@ hockey-stats/
 ├── notebooks/                  # exploration and checks
 │   ├── data_sanity.ipynb       # raw data checks (sections 1-13)
 │   ├── xg_features_check.ipynb # xG feature table checks
-│   └── xg_model_dev.ipynb      # baseline, LightGBM, evaluation, MoneyPuck comparison
+│   ├── xg_model_dev.ipynb      # baseline, LightGBM, evaluation, MoneyPuck comparison
+│   └── phase3_check.ipynb      # team strength + goalie rating checks and settings
 │
 ├── output/                     # generated images, posterior samples
 │   ├── game_summaries/
@@ -211,6 +220,7 @@ hockey-stats/
 **Two tracks under `stochastic/`** — `toy_mcmc.py` (Track A, your soil-pipeline port) and `hierarchical.py` (Track B, PyMC) coexist. Track A is the reference implementation; Track B is the production model. They share input contracts so the rest of the pipeline doesn't care which produced the samples.
 
 ---
+
 ## Data Contract
 
 ### Tables
@@ -220,6 +230,7 @@ hockey-stats/
 | `shot_events` | 773,259 | shot attempt (incl. blocked, shootout) | Raw; filter at query time (below) |
 | `game_events` | 2,060,996 | play-by-play event of any type | Raw; ordered by `sort_order`, never `event_id` |
 | `shot_context` | 566,545 | unblocked, non-shootout shot | Derived from `game_events` by `shot_context.py` |
+| `shot_xg` | 562,374 | scored shot (unblocked, periods 1–4, goalie in net) | Derived by `score_xg.py`; each season scored by a model that did not train on it |
 | `shifts` | 4,578,542 | player shift | |
 | `games`, `schedule` | 6,560 | game | 1,312 per season × 5 |
 
@@ -298,6 +309,8 @@ penalties and goals break the chain):
   an opponent's shot as the precursor, at physically impossible 1–2 s gaps
   (about 17% of rush flags, 0.5% of training data).
 
+---
+
 ## Parallel Build: Track A vs Track B
 
 The honest version of the model is the PyMC hierarchical NUTS sampler. But porting your AEM 8290 AM MCMC structure to a tiny hockey problem first buys real value: a reference implementation you trust, and an independent cross-check on the PyMC model.
@@ -313,6 +326,14 @@ $$\theta = (\mu_{\text{off,A}}, \mu_{\text{def,A}}, \mu_{\text{off,B}}, \mu_{\te
 $$p(y^{\text{obs}} \mid \theta) = \prod_{g} \text{Poisson}(G_{\text{home},g} \mid \lambda_{\text{home}}(\theta)) \cdot \text{Poisson}(G_{\text{away},g} \mid \lambda_{\text{away}}(\theta))$$
 
 **Priors:** bounded uniform in standardized $\xi \in [-1, 1]^4$ space, same as soil.
+
+**Identifiability — only two of the four parameters are learnable.** With $\lambda_{A} = \exp(\alpha_0 + \mu_{\text{off},A} - \mu_{\text{def},B})$ and $\lambda_{B} = \exp(\alpha_0 + \mu_{\text{off},B} - \mu_{\text{def},A})$, adding the same constant to $\mu_{\text{off},A}$ and $\mu_{\text{def},B}$ (or to $\mu_{\text{off},B}$ and $\mu_{\text{def},A}$) leaves the likelihood unchanged. The data pin down only the two differences
+
+$$d_A = \mu_{\text{off},A} - \mu_{\text{def},B}, \qquad d_B = \mu_{\text{off},B} - \mu_{\text{def},A}$$
+
+and the rest of the posterior is the bounded prior. Either sample $(d_A, d_B)$ directly, or keep four parameters and report and compare only $d_A, d_B$. Fix $\alpha_0$ to the log of the league-mean goals per team-game from the training data (about $\log 3$), so $d_A, d_B$ are on the same scale as Track B.
+
+**Expect wide posteriors.** Two teams meet three or four times a season, so even five seasons give only about 15 games per pair. Track A is a correctness check, not a source of useful team ratings.
 
 **Sampler:** Adaptive Metropolis, three phases:
 1. **Burn-in** ($n_b = 5000$): isotropic proposal $\Sigma_p = \sigma_0^2 I$ with $\sigma_0 = 0.1$
@@ -330,21 +351,26 @@ $$p(y^{\text{obs}} \mid \theta) = \prod_{g} \text{Poisson}(G_{\text{home},g} \mi
 **Model:**
 
 $$
-\begin{align}
+\begin{aligned}
 \mu_{\text{off},t} &\sim \mathcal{N}(0, \sigma_{\text{off}}^2) \quad \text{for each team } t \\
 \mu_{\text{def},t} &\sim \mathcal{N}(0, \sigma_{\text{def}}^2) \quad \text{for each team } t \\
 \gamma_{\text{goalie},g} &\sim \mathcal{N}(0, \sigma_{\text{goalie}}^2) \quad \text{for each goalie } g \\
+\alpha_0 &\sim \mathcal{N}(\log 3,\ 0.5^2) \quad \text{league baseline scoring rate} \\
 \alpha_{\text{home}} &\sim \mathcal{N}(0, 1) \\
-\log \lambda_{\text{home}} &= \alpha_{\text{home}} + \mu_{\text{off},h} - \mu_{\text{def},a} - \gamma_{\text{goalie},a} \\
-\log \lambda_{\text{away}} &= \mu_{\text{off},a} - \mu_{\text{def},h} - \gamma_{\text{goalie},h} \\
+\log \lambda_{\text{home}} &= \alpha_0 + \alpha_{\text{home}} + \mu_{\text{off},h} - \mu_{\text{def},a} - \gamma_{\text{goalie},a} \\
+\log \lambda_{\text{away}} &= \alpha_0 + \mu_{\text{off},a} - \mu_{\text{def},h} - \gamma_{\text{goalie},h} \\
 G_{\text{home}} &\sim \text{Poisson}(\lambda_{\text{home}}) \\
 G_{\text{away}} &\sim \text{Poisson}(\lambda_{\text{away}})
-\end{align}
+\end{aligned}
 $$
 
 **Hyperpriors** on $\sigma_{\text{off}}, \sigma_{\text{def}}, \sigma_{\text{goalie}}$ — typically half-normal or half-Cauchy.
 
-**Sampler:** NUTS, default PyMC settings to start, reparameterize if divergences appear.
+**Why the global intercept $\alpha_0$ is required.** Every team and goalie effect has a zero-mean prior, so without $\alpha_0$ the model is centered at $\log \lambda = 0$, i.e. about 1 goal per team per game instead of about 3. The team effects would have to shift together to make up the difference, fighting their own priors. $\alpha_0$ carries the league scoring level; the team and goalie effects are then deviations from it. Its prior is centered on $\log 3 \approx 1.1$ and is wide enough to let the data decide.
+
+**Remaining soft identifiability.** $\alpha_0$ can still trade off against the average of the $\mu_{\text{off}}$'s, the $\mu_{\text{def}}$'s and the $\gamma$'s. The zero-mean priors resolve this softly. If $\alpha_0$ mixes poorly or correlates strongly with the team means, add sum-to-zero constraints on $\mu_{\text{off}}$ and $\mu_{\text{def}}$ (e.g. `pm.ZeroSumNormal`).
+
+**Sampler:** NUTS. Write every random effect in non-centered form from the start ($\mu_{\text{off},t} = \sigma_{\text{off}}\, z_t$, $z_t \sim \mathcal{N}(0,1)$), because centered hierarchical models with small $\sigma$ produce funnel geometry and divergences.
 
 **Output:** ArviZ `InferenceData` with full joint posterior across all teams and goalies.
 
@@ -352,12 +378,23 @@ $$
 
 ### Cross-Validation Between Tracks
 
-For any team pair $(A, B)$:
-1. Fit Track A on $(A, B)$ head-to-head data only.
-2. Marginalize Track B's joint posterior down to the four parameters $(\mu_{\text{off},A}, \mu_{\text{def},A}, \mu_{\text{off},B}, \mu_{\text{def},B})$.
-3. Compare marginal posteriors. They should be close but not identical — Track B benefits from partial pooling across all teams, Track A doesn't.
+The two tracks only *should* agree when they are fit to the same data with the same likelihood. Comparing Track A on head-to-head games with full Track B on the whole league compares different datasets and different priors, so a gap between them proves nothing. The check is therefore done in three steps, from strict to loose.
 
-When they disagree wildly, one of them is wrong, and you have a much better debugging position than with just one implementation.
+**1. Synthetic recovery (both tracks).**
+Simulate a full league season from Track B's generative model with known parameters.
+- Fit Track B and check that the posteriors cover the true team and goalie effects.
+- Fit Track A on 2–3 team pairs from the same simulated games and check that its $d_A, d_B$ intervals cover the true differences.
+
+**2. Like-for-like on real data (the strict agreement test).**
+For 2–3 team pairs, fit Track B in a *matched* configuration on the same $(A, B)$ head-to-head games Track A sees:
+- no pooling ($\sigma_{\text{off}}, \sigma_{\text{def}}$ fixed large),
+- goalie and home terms switched off,
+- $\alpha_0$ fixed to the same value as Track A.
+
+The two posteriors on $d_A, d_B$ should then match to within Monte Carlo error. A real disagreement here means a bug in the likelihood, the parameterization or one of the samplers.
+
+**3. Pooled Track B vs Track A (qualitative only).**
+Fit full Track B on league data and compute its posterior on the same $d_A, d_B$. It should be much narrower and shrunk toward zero, and it should usually sit inside Track A's wide interval. A pooled interval far outside Track A's is a flag to investigate, not an automatic failure, since pooling and the extra league data are supposed to move it.
 
 ---
 
@@ -395,16 +432,16 @@ rebound angle change.
 search found no better setting (top six within 0.00005 log loss; 63 leaves worse).
 
 **Season roles:** train 2021-22 to 2023-24, validate 2024-25 (early stopping picks
-387 trees), then refit on 2021-22 to 2024-25 and test once on 2025-26.
-Recency weights 1.0 / 1.25 / 1.5 / 2.0, oldest to newest.
+413 trees), then refit on 2021-22 to 2024-25 and test once on 2025-26.
+Recency weights 1.0 / 1.25 / 1.5 / 2.0, oldest to newest. Random seed 42.
 
 **Results on the 2025-26 test season:**
 
 | | Baseline (distance + angle, logistic) | Final LightGBM |
 |---|---|---|
 | AUC | 0.714 | **0.769** |
-| Log loss | 0.2307 | **0.2168** |
-| Predicted vs actual goals | +1.4% | +2.4% (7,763 vs 7,578) |
+| Log loss | 0.2307 | **0.2167** |
+| Predicted vs actual goals | +1.4% | +2.5% (7,770 vs 7,578) |
 | Calibration | Mid-range under, top over | Within 0.8 points in every decile |
 
 What moved the score, in order: LightGBM over logistic regression; previous-event
@@ -414,40 +451,108 @@ features; recency weighting; shot-type grouping (fixed the goal total).
 xGF r = 0.970, xGA r = 0.940, total xG ratio 1.000. MoneyPuck blocks scripted
 downloads; save `teams.csv` by hand to `data/external/`.
 
-**Saved models (`output/models/`):**
-- `xg_lgbm_20212022_20242025.pkl` + `_metrics.json` — the evaluated model
-- `xg_lgbm_live.pkl` — same settings, trained on all five seasons, for scoring new games
+**Saved models (`output/models/`), version v1:**
+- `xg_lgbm_v1_20212022_20242025.pkl` + `_metrics.json` — the evaluated model
+- `xg_lgbm_v1_live.pkl` + `_metrics.json` — same settings, trained on all five seasons, for scoring new games
+- `XG_MODEL_PATH` in `config/settings.py` names the active model; load it with `load_active_model()`.
+- Metrics files record version, seed, settings, features, training seasons, data cutoff and library versions.
+- `train_xg.py` refuses to overwrite an existing file; bump `MODEL_VERSION` in `xg.py` when features or settings change.
 
 **Gaps against the original plan:**
 - MoneyPuck validation was done on team-season totals, not per-game totals. Per-game is stricter and still to do.
-- No version number in the file name and no config entry pointing to the active model.
-- Random seed and library versions are not yet saved with the model.
 - Method is named `.predict()`, not `.predict_proba()`.
 
-### Phase 3 — Team Strength & Goalie Aggregates (Week 4) — NEXT
+### Phase 3 — Team Strength & Goalie Aggregates (Week 4) — DONE
 
-- **First:** score every shot with the xG model and store the result in a
-  `shot_xg` table. Team xGF/60 and goalie GSAx are sums over that table. Score
-  each season with a model that did not train on it (walk-forward), or past
-  teams' xG is flattered by a model that has seen their games. `shot_events`
-  already stores `goalie_id` for GSAx.
-- `src/processing/team_strength.py`: rolling 25-game windows of xGF/60 and xGA/60 per team.
-- `src/models/stochastic/goalie.py`: simple Bayesian goalie rating. Beta-Binomial on save proportion, or Normal-Normal on GSAx/60. No hierarchy yet — that comes in Track B.
-- Both produce: point estimate + variance for each team / goalie at any point in the season.
+**Files:**
+- `src/pipelines/score_xg.py` — scores every shot into the `shot_xg` table. Run with `py -m src.pipelines.score_xg [--season YYYYYYYY]`.
+- `src/processing/team_strength.py` — `team_game_xg(conn)`, `rolling_strength(tg, window=25)`, `strength_as_of(tg, date)`
+- `src/processing/goalie.py` — `goalie_game_xg(conn)`
+- `src/models/stochastic/goalie.py` — `goalie_rating_as_of(gg, date, k=800, lookback_days=730, season_adjust=True)`
+- `notebooks/phase3_check.ipynb` — correctness checks plus the tests that chose the window and `k`
+
+**Scoring every shot (`shot_xg`).** Each season 2021-22 to 2025-26 is scored by a
+leave-one-season-out model (trained on the other four seasons, 413 trees, same settings
+as v1), so no shot is scored by a model that saw it. Seasons the live model never
+trained on (2026-27 onward) are scored by the live model. xG / goals by season:
+1.032, 1.031, 0.974, 0.969, 1.024 (see *Season-level xG offset* in Open Questions).
+
+**Team strength.** One row per team per game (`team_game_xg`): xGF, xGA, goals for and
+against (periods 1–4, empty-net goals included) and game length in minutes (overtime
+counted). `rolling_strength` adds each team's estimate going *into* every game from its
+previous 25 games: xGF/60 and xGA/60 as total xG ÷ total minutes × 60, and their variance
+(game-to-game variance ÷ games). Windows span seasons. `strength_as_of` gives the same
+estimate for every team on any date.
+
+**Goalie rating.** `goalie_game_xg` credits each shot to the goalie in net, so a pulled
+starter and his replacement each carry only the shots they faced. The rating is
+Gamma-Poisson on goals allowed per expected goal:
+
+$$
+GA \sim \text{Poisson}(\theta \cdot xGA), \qquad \theta \sim \text{Gamma}(k, k), \qquad
+\theta \mid \text{data} \sim \text{Gamma}(k + GA,\; k + xGA)
+$$
+
+$\theta < 1$ is better than average. Each season's xGA is first rescaled so league
+GA ÷ xGA = 1.0 within that season (using only games before the rating date). Output per
+goalie: posterior mean and variance of $\theta$, a 90% credible interval, raw GSAx and
+games. This is the swappable goalie interface; on Track B's additive log scale,
+$\gamma_g \approx -\log \theta_g$ (positive = better).
+
+**Results (`phase3_check.ipynb`):**
+
+Correctness: two rows per game (13,120), league xGF = league xGA, xGF and goalie xGA per
+season match `shot_xg` exactly, every goalie-game named, and a hand-computed pre-game
+estimate matches `rolling_strength` (no leakage).
+
+Team strength predicting the next game (6,381 games where both teams had 10+ games of history):
+
+| Window | Correlation with goal diff (xG) | (goals) | Picks winner (xG) |
+|---|---|---|---|
+| 10 | 0.233 | 0.168 | 58.2% |
+| 25 | **0.251** | 0.206 | **59.3%** |
+| 50 | **0.251** | 0.240 | 59.1% |
+
+xG-based estimates beat goals-based ones at every window. 25 and 50 tie; 25 is kept
+because it reacts faster.
+
+Goalie rating predicting the next season (2022-23 to 2025-26 pooled, 253 goalie-seasons
+with 20+ games, correlation margin of error about ±0.12):
+
+| k | Weighted error (adjusted) | Correlation (adjusted) | Correlation (unadjusted) |
+|---|---|---|---|
+| 1 (raw record) | 0.0284 | 0.037 | 0.043 |
+| 100 | 0.0138 | 0.100 | 0.094 |
+| 400 | 0.0120 | 0.120 | 0.105 |
+| **800** | **0.0119** | 0.124 | 0.106 |
+| 1600 | 0.0119 | 0.125 | 0.106 |
+
+The season adjustment improves error and correlation from k = 100 up. Error is lowest at
+k = 800 and flat from about 400 to 1,600. The signal is real but weak: a goalie's past two
+seasons are a modest guide to his next one, consistent with public hockey analytics. With
+k = 800, ratings for big-sample goalies span roughly 0.96 to 1.04.
+
+**Settings kept:** team window 25 games; goalie `k = 800`, `season_adjust=True`,
+`lookback_days = 730`.
+
+**Notes:**
+- `games` in goalie output counts appearances, so a short relief stint counts as one game. The rating itself is weighted by xGA faced, not games.
+- Utah (`UTA`) has a different abbreviation from Arizona, so its team-strength history starts fresh in 2024-25.
+- Goalie names come from `goalie_game_stats` (boxscores), which covers every goalie who played, not only current rosters.
 
 ### Phase 4 — Track A Toy MCMC (Week 5)
 
 - Port your AM sampler from soil to `src/models/stochastic/am_sampler.py`.
-- Write `src/models/stochastic/toy_mcmc.py`: 4-parameter Poisson model for one team pair.
+- Write `src/models/stochastic/toy_mcmc.py`: 4-parameter Poisson model for one team pair, with $\alpha_0$ fixed and results reported on the identified differences $d_A, d_B$.
 - Write `src/pipelines/fit_toy.py`: load team pair data, run AM, save posterior samples (ArviZ NetCDF for consistency with Track B), produce diagnostics (trace plots, ACF, acceptance rate).
 - Validate: synthetic recovery on simulated data with known $\theta^*$, like the soil project's posterior recovery check.
 
 ### Phase 5 — Track B Hierarchical PyMC (Week 6)
 
-- Write `src/models/stochastic/hierarchical.py` with the full league model.
+- Write `src/models/stochastic/hierarchical.py` with the full league model: global intercept $\alpha_0$, non-centered random effects, and a switch for the matched no-pooling configuration used in the cross-check.
 - Write `src/pipelines/fit_hierarchical.py`: load full-season game data, fit, save InferenceData.
 - Diagnostics: $R$-hat, ESS, divergences, energy plots.
-- Cross-validate against Track A on 2–3 team pairs.
+- Cross-validate against Track A on 2–3 team pairs using the three steps in *Cross-Validation Between Tracks* (synthetic recovery, matched like-for-like fit, then pooled comparison).
 
 ### Phase 6 — Game Model + Monte Carlo (Week 7)
 
@@ -469,6 +574,133 @@ downloads; save `teams.csv` by hand to `data/external/`.
 - Fit on team-level input ranges (e.g., xGF/60 ∈ [2.0, 3.5], goalie GSAx ∈ [-0.3, 0.5]) with $P(\text{home win})$ as the QoI.
 - `src/analysis/sensitivity.py`: analytical Sobol indices from PCE coefficients (the "sensitivity for free" trick).
 - Cross-check with Saltelli sampling on the surrogate.
+
+## v2 — Planned Improvements
+
+Everything in this section comes **after Phase 7**: the v1 team model has to be built and backtested first, because it is the baseline each improvement must beat. Each item is kept only if it improves held-out log loss in the Phase 7 walk-forward backtest.
+
+| Item | What it adds | Main payoff |
+|---|---|---|
+| **v2.1 Hierarchical xG layer** | Shooter, goalie, rink and season × shot-type effects on top of LightGBM xG | Finishing talent, a shrunk xG-based goalie rating, fixes for arena bias and redirect drift |
+| **v2.2 Lineup model** | Per-skater offensive/defensive effects (Bayesian RAPM), aggregated over tonight's lineup | Predictions that react to injuries, scratches and trades |
+| **v2.3 Other candidates** | Score/rest/travel effects, better OT/SO, goal dependence, etc. | Smaller calibration gains |
+
+### v2.1 — Hierarchical xG Layer
+
+**Why a layer, not a fully Bayesian xG model.** LightGBM already pins down the shot-geometry function: with 562k shots, uncertainty in the distance/angle/shot-type curve is negligible next to game randomness and team-strength uncertainty. A fully Bayesian xG model would be slow on 562k shots and would need its nonlinear interactions written by hand, likely losing AUC. What LightGBM *can't* do is tell shooters, goalies and rinks apart, or let shot-type conversion drift by season. A small hierarchical model on top of it adds exactly that.
+
+**Model.** LightGBM's prediction enters as a fixed offset; only the random effects are estimated:
+
+$$
+\begin{aligned}
+\text{logit}\, p_i &= \text{logit}(xG^{\text{lgbm}}_i) + \beta_{s[i]} - \gamma_{g[i]} + \delta_{r[i]} + \varepsilon_{k[i]} \\
+\beta_s &\sim \mathcal{N}(0, \sigma_\beta^2) \quad \text{shooter finishing talent} \\
+\gamma_g &\sim \mathcal{N}(0, \sigma_\gamma^2) \quad \text{goalie skill (positive = better, same sign as Track B)} \\
+\delta_r &\sim \mathcal{N}(0, \sigma_\delta^2) \quad \text{rink / arena recording effect} \\
+\varepsilon_k &\sim \mathcal{N}(0, \sigma_\varepsilon^2) \quad \text{season} \times \text{shot-type group} \\
+y_i &\sim \text{Bernoulli}(p_i)
+\end{aligned}
+$$
+
+Half-normal hyperpriors on the four $\sigma$'s. Partial pooling shrinks low-volume shooters and goalies toward zero; high-volume ones keep their own estimate.
+
+**What each term addresses:**
+- $\beta$ — finishing talent. Feeds player point distributions later.
+- $\gamma$ — a shrunk, xG-adjusted goalie rating. Replaces the Phase 3 conjugate rating if it backtests better.
+- $\delta$ — the arena recording bias from Open Questions. A logit intercept per rink is an approximation: the real bias is in recorded *location*, so a distance-adjustment version is a later refinement. Home teams play 41 games in their own rink, so $\delta$ is partly confounded with home shooters and goalies; fitting all terms jointly is what separates them.
+- $\varepsilon$ — the redirect location drift. Lets conversion by shot type move season to season instead of relying only on retraining.
+
+**Inputs — the one hard rule.** The offset must come from the walk-forward `shot_xg` table (Phase 3), never from in-sample LightGBM predictions. In-sample xG is overfit, its residuals look too small, and the random effects would be shrunk toward zero.
+
+**Fitting.**
+- NumPyro NUTS (or PyMC with the NumPyro backend). Plain PyMC on 562k Bernoulli rows is slow.
+- Non-centered parameterization for every random effect from the start.
+- Parameter count is a few thousand (shooters dominate) — fast once the offset does the heavy lifting.
+
+**Files:**
+- `src/models/stochastic/xg_hierarchical.py` — model definition.
+- `src/pipelines/fit_xg_layer.py` — load `shot_xg` + IDs, fit, save `output/posteriors/xg_layer_<season>.nc`.
+- Adjusted per-shot xG (posterior mean and sd) written to a `shot_xg_v2` table; `shot_xg` stays untouched.
+
+**Validation — keep the layer only if it earns it:**
+1. **Synthetic recovery.** Simulate shots on top of real offsets with known $\beta, \gamma, \delta, \varepsilon$; check recovery, same discipline as the soil project.
+2. **Held-out shot log loss.** Fit on seasons up to $t-1$, score season $t$; must beat the LightGBM offset alone.
+3. **Posterior predictive checks.** Goals per shooter, per goalie and per rink against their predictive intervals.
+4. **Sanity of the spreads.** $\sigma_\beta$ and $\sigma_\gamma$ should be small (finishing and goaltending talent are real but modest on the logit scale).
+5. **Game-level payoff.** Swap $\gamma$ into the game model in place of the Phase 3 goalie rating and rerun the Phase 7 backtest. Keep whichever gives better game log loss.
+
+**Open design question — goalie double-counting.** Track B also has a $\gamma_{\text{goalie}}$ term. If the game model uses the xG-layer goalie effect, either drop Track B's goalie term or use the xG-layer posterior as its prior. Don't let goalie skill enter twice.
+
+### v2.2 — Lineup (Player-Level) Model
+
+**Idea.** The v1 game model rates *teams*. It can't tell when a top player is injured, scratched or traded. The lineup model rates each *skater's* effect on xG for and against, then builds tonight's team strength from tonight's dressed lineup. It is essentially Bayesian RAPM, fit with the same hierarchical/NUTS machinery as Track B.
+
+**Data unit: the stint.** A stint is a stretch of time during which the set of players on the ice doesn't change; any line change by either team ends it. `stints.py` builds them by overlaying the 12 on-ice players' intervals from `shifts` and cutting at every change. Each stint records duration, the 10 skaters and 2 goalies, strength, score state, zone start, and shots and summed xG for each side. Expect a few hundred stints per game, on the order of a couple million over five seasons.
+
+**Model (sketch).** For stint $j$ with duration $t_j$:
+
+$$
+\text{rate}_{\text{home},j} = \alpha_0 + \alpha_{\text{home}} + \sum_{p \in \text{home skaters}} o_p - \sum_{q \in \text{away skaters}} d_q + \text{(score, zone terms)}
+$$
+
+and the mirror image for the away side. Each skater gets an offensive effect $o_p$ (raises his team's xG rate) and a defensive effect $d_p$ (suppresses the opponent's). Partial pooling learns the prior widths instead of tuning a ridge penalty, and the joint posterior shows when linemates can't be told apart (their effects come out negatively correlated).
+
+**From ratings to a game prediction.**
+1. Take tonight's dressed lineup (known about an hour before puck drop).
+2. Project each player's ice time from **past games only**.
+3. Team xGF/60 and xGA/60 ≈ ice-time-weighted sums of the dressed players' $o_p$ and $d_p$.
+4. Convert xG to goals with finishing and goaltending effects (tonight's starting goalie; later the v2.1 shooter $\beta$ and goalie $\gamma$).
+5. Feed $\lambda_{\text{home}}, \lambda_{\text{away}}$ into the same Phase 6 game model and Monte Carlo. Nothing downstream changes.
+
+**Choices and tentative defaults.** None of these need deciding until Phase 7 is done; the defaults are starting points, not decisions.
+
+*Before starting*
+
+| # | Choice | Options | Tentative default |
+|-|----------|------------------|------------------|
+| 1 | Order within v2 | Lineup model first, xG layer first, or both | xG layer first — smaller, and its $\beta, \gamma$ feed step 4 |
+| 2 | Ridge RAPM reference | Yes / no | Yes — fit `deterministic/rapm.py` with scikit-learn first and check the Bayesian means against it |
+
+*Model design*
+
+| # | Choice | Options | Tentative default |
+|-|----------|------------------|------------------|
+| 3 | Likelihood | Weighted Gaussian on xG/60; Tweedie on summed xG; two-part (shot counts + shot quality) | Weighted Gaussian (variance ∝ 1/duration); upgrade later |
+| 4 | Scale of player effects | Linear on the xG rate, or log scale (effects multiply) | Linear — comparable to public RAPM |
+| 5 | Game situations | 5v5 only, or separate PP/PK player effects | 5v5 only; special teams stay team-level |
+| 6 | Stint covariates | Score state, zone start, home ice, back-to-backs | Score state, zone start, home ice |
+| 7 | Prior structure | One shared $\sigma$; separate forward/defense $\sigma$; prior centered on last season | Separate F/D $\sigma$; no carryover in the first version |
+| 8 | Data window | Rolling 2–3 seasons, or all 5 with recency weights | Rolling 2 seasons |
+| 9 | Goalies in the stint model | In or out | Out — goalies affect whether shots go in, not shot quality; they enter at step 4 |
+| 10 | Fitting method | NumPyro NUTS, or variational / Laplace approximation | NumPyro NUTS, sparse design matrix; approximate only if too slow |
+
+*Making a prediction*
+
+| # | Choice | Options | Tentative default |
+|-|----------|------------------|------------------|
+| 11 | Ice-time projection | Last-$N$-games average share, or line-based deployment | Last 10 games, rescaled so the dressed lineup sums to a full game |
+| 12 | Lineup source in the backtest | Actual dressed lineup vs. projected lineup | Actual dressed lineup (known pregame) with **projected** TOI — never that game's real TOI |
+| 13 | xG → goals | League-average finishing + Phase 3 goalie rating, or v2.1 $\beta, \gamma$ | League average + Phase 3 goalie first; swap in v2.1 later |
+
+*Evaluation*
+
+| # | Choice | Options | Tentative default |
+|-|----------|------------------|------------------|
+| 14 | What counts as winning | Better overall game log loss, or better on games with major lineup changes | Score both. Fix the "major change" threshold in advance (e.g. a top-6 F or top-4 D out) |
+
+**Validation.** Same Phase 7 walk-forward harness as the team model: game log loss and Brier, overall and on the lineup-change subset. Plus synthetic recovery on simulated stints with known player effects. If the lineup model only wins on lineup-change games, consider a cheaper hybrid: the team model adjusted for known missing players.
+
+**Files.** `src/processing/stints.py`, `src/models/stochastic/lineup_rapm.py`, `src/pipelines/fit_lineup.py`, posteriors to `output/posteriors/lineup_<window>.nc`.
+
+### v2.3 — Other Candidate Improvements
+
+Smaller items already listed under *Open Questions*, gathered here so v2 has one list:
+- **Score effects, rest, travel, back-to-backs** as game-model covariates.
+- **OT/SO model** weighted by goalie quality instead of a flat 50/50.
+- **Goal dependence:** Dixon-Coles correction or a bivariate model, instead of independent home/away Poisson.
+- **Arena bias, location version:** adjust recorded shot distance per rink, refining the v2.1 rink intercept.
+- **Rebound and rush windows:** test 2/3/4 s by retraining xG and comparing validation log loss.
+- **Player-level point distributions:** built on the v2.2 player effects plus the v2.1 shooter finishing effects.
 
 ---
 
@@ -510,7 +742,8 @@ Sobol analysis at the end ranks which of these matter most for which outcomes.
 
 ## Persistence & Reproducibility
 
-- **xG model:** pickle under `output/models/` (`train_xg.py` writes the model and a `_metrics.json`). Still to add: version number and a config entry pointing to the active version.
+- **xG model:** pickle under `output/models/`, named with `MODEL_VERSION` (`xg_lgbm_v1_*`), plus a `_metrics.json` with version, seed, settings, data cutoff and library versions. `XG_MODEL_PATH` in `config/settings.py` points to the active model.
+- **Per-shot xG:** the `shot_xg` table, rebuilt by `score_xg.py`; each row records the model version and which model scored it.
 - **Posterior samples:** ArviZ NetCDF under `output/posteriors/`. Both tracks write to the same format so downstream code is sampler-agnostic.
 - **PCE surrogate:** pickle with input-range metadata and coefficient array.
 - **Backtest results:** CSV under `output/backtests/` with one row per held-out game (date, teams, prediction, outcome, log-loss contribution).
@@ -531,17 +764,24 @@ These are real decisions but premature to make now:
 - **Whether to use `__init__.py` re-exports** for cleaner imports. Default to empty files; refactor later if imports get ugly.
 - **OT/SO model.** Start with a flat 50/50 conditional on tied regulation. Upgrade to a goalie-quality-weighted shootout model later if it materially changes calibration.
 - **Score effects, rest, travel, back-to-backs.** Real factors, but adding them prematurely complicates the base model. Document as v2 features.
-- **Player-level point distributions.** Requires shift-level data and per-player rate modeling. Defer until team-level pipeline is calibrated.
+- **Player-level point distributions.** Requires shift-level data and per-player rate modeling. Defer until team-level pipeline is calibrated; planned on top of the v2.2 lineup model.
 
-**Data and xG items found in Phases 1–2:**
+**Data and model items found in Phases 1–3:**
 
-- **Redirect location drift.** Each season, redirects are recorded closer to the net (share under 10 ft: 24.8% in 2021-22 → 38.2% in 2025-26) while their goal rate falls (9.4% → 7.5%). The model overrates 2025-26 redirects by about 24%, and this accounts for most of the +2.4% total bias. Recency weighting helps only slightly. Retrain every season.
-- **Arena recording bias.** Some rinks log shot locations closer or farther than others. MoneyPuck adjusts for it; this model does not. v2 refinement.
+- **Redirect location drift.** Each season, redirects are recorded closer to the net (share under 10 ft: 24.8% in 2021-22 → 38.2% in 2025-26) while their goal rate falls (9.4% → 7.5%). The model overrates 2025-26 redirects by about 24%, and this accounts for most of the +2.4% total bias. Recency weighting helps only slightly. Retrain every season. The v2.1 season × shot-type effect ($\varepsilon$) is the planned fix.
+- **Arena recording bias.** Some rinks log shot locations closer or farther than others. MoneyPuck adjusts for it; this model does not. Planned fix: rink effect ($\delta$) in v2.1.
 - **Timestamp artifacts.** The feed logs whole seconds, so an opponent's shot can appear 1–2 s before a shot at the other net. Affects about 0.5% of shots.
 - **NST rush definition.** NST appears not to count an opponent's shot as a rush precursor. Unconfirmed at three events; a query-time filter gives NST parity if needed.
 - **Rebound and rush windows.** 3 s and 4 s are NST conventions, not fitted. Test 2/3/4 s by retraining and comparing validation log loss.
 - **Previous-event location for stoppage-type events** is missing for about 0.5% of shots.
 
+- **Season-level xG offset.** Leave-one-season-out xG runs about 3% high in 2021-22 and 2022-23 and about 3% low in 2023-24 and 2024-25 (xG/goals 1.032, 1.031, 0.974, 0.969, 1.024). Normal luck would move this about 1%, so goal conversion is changing between seasons more than shot quality explains (goaltending trends, recording changes, play the features miss). Within-season team comparisons are unaffected. Goalie ratings now handle it (`season_adjust=True` rescales each season to its own league average). The Phase 6 game model still needs a per-season league-average term or the same rescaling for team xG.
+- **Early-season team strength.** v1 rolling windows span seasons (the last 25 games, whatever season), so every team has an estimate on opening night but off-season roster changes are ignored. Refinement: pull early-season estimates toward the league average.
+- **When to retrain the xG model.** Keep the live model fixed during a season, so it never scores games it trained on. After the season ends, add it, move `CURRENT_SEASON` / `LAST_SEASON` forward one year, and run `train_xg.py --final` and `score_xg.py`.
+- **Rename `CURRENT_SEASON` to `TEST_SEASON`.** It is used as the xG test season, not the season being played, which is easy to confuse.
+- **Goalie signal is weak.** Adjusted next-season correlation is 0.125 (±0.12), so goalies should move game predictions only modestly. Repeat the `k` test when a new season is added; the best value sat on a flat stretch (400–1,600).
+- **Team strength ignores schedule strength.** The rolling window doesn't adjust for the quality of opponents faced. Track B's joint fit handles this; the v1 rolling estimate does not.
+- **Per-game MoneyPuck comparison** is still to do (Phase 2 gap).
 ---
 
 ## Decisions Made
@@ -566,6 +806,23 @@ Decided during Phases 1–2:
 - **Recency weighting on** (1.0 / 1.25 / 1.5 / 2.0).
 - **No recalibration step:** the remaining bias is concentrated in redirects, so a uniform shift would worsen other shot types.
 - **Trained `.pkl` files stay out of git;** rebuild with `train_xg.py`.
+
+Decided during Phase 3:
+
+- **Per-shot xG comes from leave-one-season-out models** for historical seasons and from the live model for new ones; stored in `shot_xg`.
+- **Team strength:** rolling 25-game window spanning seasons, total xG ÷ total minutes, variance = game-to-game variance ÷ games. Estimates use only earlier games.
+- **Goalie rating:** Gamma-Poisson on GA ÷ xGA, `k = 800`, season-adjusted, two-season lookback. Chosen by the next-season prediction test in `phase3_check.ipynb`.
+- **Goalie GA excludes empty-net and shootout goals;** team GA/GF include empty-net goals.
+- **Build Phase 3 on complete seasons;** load 2026-27 when live predictions are needed. Keep the live xG model fixed during a season.
+
+Decided 2026-10-17:
+
+- **LightGBM stays as the xG base.** Shooter, goalie, rink and season effects go in a v2 hierarchical layer that uses walk-forward LightGBM xG as a fixed offset, not in a fully Bayesian replacement.
+- **Track B gets a global intercept** $\alpha_0 \sim \mathcal{N}(\log 3, 0.5^2)$ and non-centered random effects from the start.
+- **Track A reports only identified quantities** ($d_A, d_B$), with $\alpha_0$ fixed to the league mean.
+- **Track A vs Track B agreement is tested like-for-like** (matched no-pooling Track B on the same games); the pooled comparison is qualitative only.
+- **Lineup (player-level) model is v2,** after Phase 7. Its choices are listed in v2.2 with tentative defaults, not decided.
+- **One goalie rating.** The Phase 3 goalie rating is built as a swappable interface; the v2 goalie effect replaces it only if it wins the Phase 7 backtest.
 
 ---
 
@@ -606,5 +863,23 @@ Decided during Phases 1–2:
 **Early stopping** — Stop adding trees once the validation score stops improving, to avoid overfitting.
 
 **Recency weighting** — Counting recent seasons more in training so the model follows current recording habits.
+
+**Stint** — A stretch of game time during which the set of players on the ice does not change. The unit of data for RAPM.
+
+**Tweedie distribution** — A compound Poisson–Gamma distribution: a point mass at zero plus a continuous positive part. Fits summed xG per stint.
+
+**Offset** — A term added to a model's linear predictor with its coefficient fixed at 1, not estimated. In the v2 xG layer, logit(LightGBM xG) is the offset, so the Bayesian model only learns adjustments to it.
+
+**Partial pooling** — In a hierarchical model, group effects (teams, shooters, goalies) share a common prior whose width is learned. Groups with little data are pulled toward the average; groups with lots of data keep their own estimate.
+
+**Non-centered parameterization** — Writing a random effect as $\beta_s = \sigma_\beta z_s$ with $z_s \sim \mathcal{N}(0,1)$ instead of sampling $\beta_s \sim \mathcal{N}(0, \sigma_\beta^2)$ directly. Removes the "funnel" geometry that causes NUTS divergences when $\sigma$ is small.
+
+**Leave-one-season-out** — Scoring each season with a model trained on all the other seasons, so no prediction comes from a model that saw that data.
+
+**Conjugate prior** — A prior that, combined with the likelihood, gives a posterior of the same family, so the update is a simple formula. Gamma is conjugate to Poisson: Gamma(k, k) becomes Gamma(k + GA, k + xGA).
+
+**Credible interval** — A range that contains the true value with a stated probability under the posterior (e.g. 90%). The Bayesian counterpart of a confidence interval.
+
+**Shrinkage** — Pulling estimates from small samples toward the average. In the goalie rating, `k` sets how strongly.
 
 **Proper scoring rules** — Loss functions for probabilistic predictions that are minimized in expectation by the true distribution. Log-loss, Brier, CRPS are proper. RMSE on probabilities is not.

@@ -20,6 +20,7 @@ Typical use (see src/pipelines/train_xg.py):
 
 from __future__ import annotations
 
+import platform
 from datetime import datetime
 from pathlib import Path
 
@@ -27,9 +28,18 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.metrics import log_loss, roc_auc_score
 
 from src.processing.xg_processing import FEATURE_COLS, TARGET_COL
+
+# Bump when features, settings or training method change, so a new model never
+# overwrites an old one under the same name.
+MODEL_VERSION = "v1"
+
+# Fixes LightGBM's random choices (which shots and features each tree sees),
+# so the same data and code always produce the same model.
+RANDOM_SEED = 42
 
 # Settings confirmed by the Phase 2 grid search (31/200 tied the best; 63 leaves was worse)
 DEFAULT_PARAMS = {
@@ -40,6 +50,7 @@ DEFAULT_PARAMS = {
     "subsample": 0.8,
     "subsample_freq": 1,
     "colsample_bytree": 0.8,
+    "random_state": RANDOM_SEED,
     "verbose": -1,
 }
 
@@ -69,6 +80,7 @@ class ExpectedGoalsModel:
         self.n_trees: int | None = None
         self.trained_seasons: list[int] = []
         self.trained_at: str | None = None
+        self.version = MODEL_VERSION
 
     # ------------------------------------------------------------------ fit
     def fit(self, train: pd.DataFrame, valid: pd.DataFrame | None = None) -> "ExpectedGoalsModel":
@@ -134,6 +146,26 @@ class ExpectedGoalsModel:
         return cal.groupby("bin").agg(
             shots=("goal", "size"), predicted=("xg", "mean"), actual=("goal", "mean"))
 
+    def metadata(self) -> dict:
+        """Everything needed to identify and reproduce this model."""
+        return {
+            "model_version": self.version,
+            "trained_at": self.trained_at,
+            "trained_seasons": self.trained_seasons,
+            "trees": self.n_trees,
+            "random_seed": self.params.get("random_state"),
+            "params": self.params,
+            "features": self.feature_cols,
+            "recency_weights_newest_first": list(RECENCY_WEIGHTS),
+            "software": {
+                "python": platform.python_version(),
+                "lightgbm": lgb.__version__,
+                "scikit-learn": sklearn.__version__,
+                "pandas": pd.__version__,
+                "numpy": np.__version__,
+            },
+        }
+
     def feature_importance(self) -> pd.Series:
         """Share of total gain contributed by each feature."""
         if self.model is None:
@@ -163,3 +195,16 @@ class ExpectedGoalsModel:
                 "Saved model's features differ from xg_processing.FEATURE_COLS. "
                 "Retrain with src/pipelines/train_xg.py.")
         return model
+
+
+def load_active_model() -> ExpectedGoalsModel:
+    """Load the model named by XG_MODEL_PATH in config/settings.py.
+
+    Phase 3 code should call this instead of hard-coding a file name, so
+    switching models is a one-line change in settings.
+    """
+    from config.settings import XG_MODEL_PATH
+    if not Path(XG_MODEL_PATH).exists():
+        raise FileNotFoundError(
+            f"{XG_MODEL_PATH} not found. Run: py -m src.pipelines.train_xg --final")
+    return ExpectedGoalsModel.load(XG_MODEL_PATH)
