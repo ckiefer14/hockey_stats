@@ -1,11 +1,22 @@
+# Python
 __pycache__/
 *.pyc
-.env
-*.db
-.vscode/
-output/
 *.egg-info/
 dist/
 build/
-output/
+
+# Environment and editor
+.env
+.vscode/
+.ipynb_checkpoints/
+
+# Data and generated output (rebuild with the pipelines; see README)
 data/
+*.db
+output/
+*.pkl
+*.nc
+*.nc.tmp
+
+# Run logs
+*.log
