@@ -1,0 +1,4 @@
+TODO:
+List goals in postgame cards (ie) first goal get #1 and the heat map gets #1 and the xGF gets a #1
+
+Cards that rank the teams by offensive and defensive. Goalies too

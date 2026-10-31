@@ -1,1 +1,27 @@
 [4547/6560] Game 2024020611 FAILED: 502 Server Error: Bad Gateway for url: https://api-web.nhle.com/v1/gamecenter/2024020611/boxscore
+Schedule fetch failed for CAR 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/CAR/20212022
+Schedule fetch failed for EDM 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/EDM/20212022
+Schedule fetch failed for BOS 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/BOS/20212022
+Schedule fetch failed for VGK 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/VGK/20212022
+Schedule fetch failed for SEA 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/SEA/20212022
+Schedule fetch failed for NYR 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/NYR/20212022
+Schedule fetch failed for TBL 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/TBL/20212022
+Schedule fetch failed for UTA 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/UTA/20212022
+Schedule fetch failed for MIN 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/MIN/20212022
+Schedule fetch failed for NJD 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/NJD/20212022
+Schedule fetch failed for OTT 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/OTT/20212022
+Schedule fetch failed for TOR 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/TOR/20212022
+Schedule fetch failed for DAL 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/DAL/20212022
+Schedule fetch failed for COL 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/COL/20212022
+Schedule fetch failed for SJS 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/SJS/20212022
+Schedule fetch failed for NYI 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/NYI/20212022
+Schedule fetch failed for MTL 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/MTL/20212022
+Schedule fetch failed for FLA 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/FLA/20212022
+Schedule fetch failed for STL 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/STL/20212022
+Schedule fetch failed for WPG 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/WPG/20212022
+Schedule fetch failed for DET 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/DET/20212022
+Schedule fetch failed for WSH 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/WSH/20212022
+Schedule fetch failed for BUF 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/BUF/20212022
+Schedule fetch failed for ANA 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/ANA/20212022
+Schedule fetch failed for NSH 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/NSH/20212022
+Schedule fetch failed for PIT 20212022: 429 Client Error: Too Many Requests for url: https://api-web.nhle.com/v1/club-schedule-season/PIT/20212022

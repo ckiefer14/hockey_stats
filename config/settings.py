@@ -17,7 +17,7 @@ CURRENT_SEASON = "20252026"
 LAST_SEASON = "20242025"
 
 # Seasons the data loader pulls; add a season here when it starts
-SEASONS = ["20212022", "20222023", "20232024", "20242025", "20252026"]
+SEASONS = ["20212022", "20222023", "20232024", "20242025", "20252026","20262027"]
 
 # Output directory
 OUTPUT_DIR = PROJECT_ROOT / 'output'
