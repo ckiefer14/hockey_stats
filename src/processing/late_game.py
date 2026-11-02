@@ -89,9 +89,15 @@ def game_results(conn: sqlite3.Connection, gt: pd.DataFrame) -> pd.DataFrame:
 def mean_rates(post, gt: pd.DataFrame) -> pd.DataFrame:
     """Each game's regulation scoring rates from Track B posterior means.
 
-    post: the posterior group of a saved Track B fit (needs alpha0, alpha_home, mu_off, mu_def).
+    post: the posterior group of a saved Track B fit (needs alpha0, alpha_home, mu_off, mu_def;
+          a time-varying v2.0 fit uses its rating paths, so each game gets the ratings of its date).
     Returns game_id, lam_home, lam_away (expected regulation goals per game).
     """
+    from src.models.stochastic.hierarchical_tv import is_time_varying, add_paths, game_rates
+    if is_time_varying(post):                 # v2.0: each game's rate as of its own date
+        d = add_paths({"alpha_home": post["alpha_home"].values.reshape(-1)}, post)
+        lam_home, lam_away = game_rates(d, gt)
+        return pd.DataFrame({"game_id": gt["game_id"].to_numpy(), "lam_home": lam_home, "lam_away": lam_away})
     m = {n: post[n].values.reshape(-1, *post[n].values.shape[2:]).mean(axis=0)
          for n in ["alpha0", "alpha_home", "mu_off", "mu_def"]}
     hi, ai = gt["home_idx"].to_numpy(), gt["away_idx"].to_numpy()

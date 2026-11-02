@@ -1,0 +1,405 @@
+"""
+hierarchical_tv.py
+==================
+Track B v2.0: v1.1 (ratings from xG + goals) with ratings that change over time.
+
+Home: src/models/stochastic/hierarchical_tv.py
+
+Time is cut into steps of `step_days` days (7 = weekly; 2 is about one step per game).
+Only steps that contain games exist; the gap between two steps sets how far things can
+move between them. A gap of more than SEASON_GAP_DAYS is an off-season.
+
+  Team shot-quality ratings (random walk, one per team, offense and defense):
+      mu[t, 0] = sigma * z0[t]
+      mu[t, k] = mu[t, k-1] + s_k * eps[t, k],   eps summing to zero over teams each step
+      s_k = tau * sqrt(gap_days / 7)  in season  (tau = typical change per week)
+      s_k = tau_summer               across an off-season
+  League levels (random walks, same rule, their own tau's):
+      beta0[k]   league xG per team-game (log)
+      delta0[k]  league goals per xG (log): finishing / goaltending trends
+  Per game (step k), exactly as v1.1:
+      log nu_home  = beta0[k] + beta_home + mu_off[h, k] - mu_def[a, k]
+      xG_home ~ Gamma(mean nu_home, shape kappa)
+      log lam_home = log nu_home + delta0[k] + delta_home + phi_off[h] - phi_def[a] - gamma_away
+      goals ~ tie-inflated Poisson(lam_home, lam_away; rho)
+  Finishing effects phi, home ice, kappa and rho stay fixed over time.
+
+The zero-sum steps make league-wide changes go to beta0 / delta0 and team changes to mu:
+without them, a league-wide rise in scoring would move all 32 ratings together.
+
+Ratings for prediction: after sampling, `add_current_ratings` steps every draw forward from
+the last step to the window end (adding the drift for that gap, an off-season step if it
+crosses one) and saves the result under the v1 names (alpha0, alpha_home, mu_off, mu_def),
+so game_model, the simulators, predict_day, the cards and the backtest work unchanged.
+The weekly paths are kept as mu_off_path / mu_def_path / beta0_path / delta0_path.
+"""
+
+import numpy as np
+import pandas as pd
+import pymc as pm
+import pytensor.tensor as pt
+
+from src.models.stochastic.hierarchical import K_MAX, sample_scores
+from src.models.stochastic.hierarchical_xg import (
+    BETA0_PRIOR, HOME_PRIOR_SD, DELTA_PRIOR_SD, SIGMA_PRIOR_SD, SIGMA_PHI_PRIOR_SD,
+    LOG_KAPPA_PRIOR, TIE_PRIOR_SD, XG_COLS, GOAL_COLS, XG_FLOOR,
+)
+
+STEP_DAYS = 7
+SEASON_GAP_DAYS = 45          # a gap between game steps longer than this is an off-season
+
+# Random-walk step priors (half-normal sd). Per week in season; per off-season otherwise.
+TAU_TEAM_PRIOR = 0.02         # team ratings: a few hundredths a month at most
+TAU_TEAM_SUMMER_PRIOR = 0.10  # off-season: roster turnover can move a team ~0.1
+TAU_LEAGUE_PRIOR = 0.01       # league xG level / conversion, per week
+TAU_LEAGUE_SUMMER_PRIOR = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Time grid
+# ---------------------------------------------------------------------------
+
+def time_grid(dates, step_days: int = STEP_DAYS, season_gap: int = SEASON_GAP_DAYS) -> dict:
+    """Step index for each game and the time (days) between consecutive steps.
+
+    Steps are bins of `step_days` days counted from the first game; only bins with games
+    are kept. The time between two steps is the distance between their bin starts (7 for
+    consecutive weeks, 14 if a week without games sits between them); more than
+    `season_gap` days means an off-season.
+
+    Returns {"step": (n_games,) int, "start": (K,) bin start dates, "mid": (K,) bin
+             middles, "gap_days": (K,) days from the previous step (0 for the first),
+             "summer": (K,) bool, "step_days": step_days}.
+    """
+    d = pd.to_datetime(pd.Series(dates)).dt.normalize()
+    d0 = d.min()
+    bins = ((d - d0).dt.days // step_days).to_numpy()
+    used = np.unique(bins)
+    step = np.searchsorted(used, bins)
+    gap = np.zeros(len(used))
+    gap[1:] = np.diff(used) * step_days
+    start = d0 + pd.to_timedelta(used * step_days, unit="D")
+    return {"step": step, "start": start, "mid": start + pd.Timedelta(days=step_days / 2),
+            "gap_days": gap, "summer": gap > season_gap, "step_days": step_days}
+
+
+def _scales(grid: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Per step: sqrt(gap / 7) for in-season steps (0 for summer steps and step 0),
+    and a 0/1 indicator for summer steps."""
+    g = grid["gap_days"].astype(float)
+    in_season = (~grid["summer"]) & (np.arange(len(g)) > 0)
+    return np.where(in_season, np.sqrt(g / 7.0), 0.0), grid["summer"].astype(float)
+
+
+def _walk(name: str, start, tau, tau_summer, scale_in, is_summer, shape_extra=None, zero_sum=False):
+    """Random walk with non-centered steps. Returns (K,) or (K, n) tensor."""
+    K = len(scale_in)
+    if shape_extra is None:
+        eps = pm.Normal(f"{name}_eps", 0.0, 1.0, shape=K)
+        s = tau * scale_in + tau_summer * is_summer
+        return start + pt.cumsum(s * eps)
+    if zero_sum:
+        eps = pm.ZeroSumNormal(f"{name}_eps", sigma=1.0, shape=(K, shape_extra), n_zerosum_axes=1)
+    else:
+        eps = pm.Normal(f"{name}_eps", 0.0, 1.0, shape=(K, shape_extra))
+    s = (tau * scale_in + tau_summer * is_summer)[:, None]
+    return start[None, :] + pt.cumsum(s * eps, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+def build_model_tv(gt: pd.DataFrame, teams: list[str], step_days: int = STEP_DAYS) -> tuple[pm.Model, dict]:
+    """Track B v2.0 for the games in gt. Returns (model, grid)."""
+    grid = time_grid(gt["game_date"], step_days)
+    k = grid["step"]
+    K, T = len(grid["gap_days"]), len(teams)
+    scale_in, is_summer = _scales(grid)
+    coords = {"team": teams, "step": np.arange(K), "game": gt["game_id"].to_numpy()}
+
+    hi, ai = gt["home_idx"].to_numpy(), gt["away_idx"].to_numpy()
+    g_home, g_away = gt["gamma_home"].to_numpy(), gt["gamma_away"].to_numpy()
+    xg_h = np.maximum(gt[XG_COLS[0]].to_numpy(float), XG_FLOOR)
+    xg_a = np.maximum(gt[XG_COLS[1]].to_numpy(float), XG_FLOOR)
+    y_h, y_a = gt[GOAL_COLS[0]].to_numpy(), gt[GOAL_COLS[1]].to_numpy()
+    tied = (y_h == y_a).astype(float)
+
+    with pm.Model(coords=coords) as model:
+        # 1. Random-walk step sizes
+        tau_off = pm.HalfNormal("tau_off", TAU_TEAM_PRIOR)
+        tau_def = pm.HalfNormal("tau_def", TAU_TEAM_PRIOR)
+        tau_off_s = pm.HalfNormal("tau_off_summer", TAU_TEAM_SUMMER_PRIOR)
+        tau_def_s = pm.HalfNormal("tau_def_summer", TAU_TEAM_SUMMER_PRIOR)
+        tau_b = pm.HalfNormal("tau_beta0", TAU_LEAGUE_PRIOR)
+        tau_d = pm.HalfNormal("tau_delta0", TAU_LEAGUE_PRIOR)
+        tau_b_s = pm.HalfNormal("tau_beta0_summer", TAU_LEAGUE_SUMMER_PRIOR)
+        tau_d_s = pm.HalfNormal("tau_delta0_summer", TAU_LEAGUE_SUMMER_PRIOR)
+
+        # 2. League levels over time
+        beta0_init = pm.Normal("beta0_init", BETA0_PRIOR[0], BETA0_PRIOR[1])
+        delta0_init = pm.Normal("delta0_init", 0.0, DELTA_PRIOR_SD)
+        beta0 = pm.Deterministic("beta0_path", _walk("beta0", beta0_init, tau_b, tau_b_s, scale_in, is_summer),
+                                 dims="step")
+        delta0 = pm.Deterministic("delta0_path", _walk("delta0", delta0_init, tau_d, tau_d_s, scale_in, is_summer),
+                                  dims="step")
+        beta_home = pm.Normal("beta_home", 0.0, HOME_PRIOR_SD)
+        delta_home = pm.Normal("delta_home", 0.0, DELTA_PRIOR_SD)
+        log_kappa = pm.Normal("log_kappa", LOG_KAPPA_PRIOR[0], LOG_KAPPA_PRIOR[1])
+        kappa = pm.Deterministic("kappa", pm.math.exp(log_kappa))
+
+        # 3. Team shot-quality ratings over time (zero-sum steps)
+        sigma_off = pm.HalfNormal("sigma_off", SIGMA_PRIOR_SD)
+        sigma_def = pm.HalfNormal("sigma_def", SIGMA_PRIOR_SD)
+        z0_off = pm.ZeroSumNormal("z0_off", sigma=1.0, dims="team")
+        z0_def = pm.ZeroSumNormal("z0_def", sigma=1.0, dims="team")
+        mu_off = pm.Deterministic("xg_mu_off_path", _walk("off", sigma_off * z0_off, tau_off, tau_off_s,
+                                                          scale_in, is_summer, T, zero_sum=True),
+                                  dims=("step", "team"))
+        mu_def = pm.Deterministic("xg_mu_def_path", _walk("def", sigma_def * z0_def, tau_def, tau_def_s,
+                                                          scale_in, is_summer, T, zero_sum=True),
+                                  dims=("step", "team"))
+
+        # 4. Finishing effects (static, tightly pooled), as v1.1
+        s_phi_off = pm.HalfNormal("sigma_phi_off", SIGMA_PHI_PRIOR_SD)
+        s_phi_def = pm.HalfNormal("sigma_phi_def", SIGMA_PHI_PRIOR_SD)
+        phi_off = pm.Deterministic("phi_off", s_phi_off * pm.ZeroSumNormal("zp_off", sigma=1.0, dims="team"),
+                                   dims="team")
+        phi_def = pm.Deterministic("phi_def", s_phi_def * pm.ZeroSumNormal("zp_def", sigma=1.0, dims="team"),
+                                   dims="team")
+
+        # 5. xG likelihood
+        log_nu_h = beta0[k] + beta_home + mu_off[k, hi] - mu_def[k, ai]
+        log_nu_a = beta0[k] + mu_off[k, ai] - mu_def[k, hi]
+
+        def gamma_logp(x, log_nu):
+            return (kappa * (log_kappa - log_nu) - pt.gammaln(kappa)
+                    + (kappa - 1.0) * np.log(x) - kappa * x * pm.math.exp(-log_nu))
+        pm.Potential("xg_loglik", pm.math.sum(gamma_logp(xg_h, log_nu_h) + gamma_logp(xg_a, log_nu_a)))
+
+        # 6. Goals likelihood: tie-inflated Poisson, as v1.1
+        log_lam_h = log_nu_h + delta0[k] + delta_home + phi_off[hi] - phi_def[ai] - g_away
+        log_lam_a = log_nu_a + delta0[k] + phi_off[ai] - phi_def[hi] - g_home
+        lam_h, lam_a = pm.math.exp(log_lam_h), pm.math.exp(log_lam_a)
+        tau = pm.Normal("tau", 0.0, TIE_PRIOR_SD)
+        rho = pm.Deterministic("rho", pm.math.exp(tau) - 1.0)
+        pois = (y_h * log_lam_h - lam_h - pt.gammaln(y_h + 1.0)
+                + y_a * log_lam_a - lam_a - pt.gammaln(y_a + 1.0))
+        kk = np.arange(K_MAX + 1)[:, None]
+        lgk = pt.gammaln(kk + 1.0)
+        T_tie = pm.math.exp(kk * log_lam_h[None, :] - lam_h[None, :] - lgk
+                            + kk * log_lam_a[None, :] - lam_a[None, :] - lgk).sum(axis=0)
+        pm.Potential("goal_loglik", pm.math.sum(pois + tau * tied - pm.math.log1p(rho * T_tie)))
+
+        # 7. Home ice on the goal scale (as v1.1)
+        pm.Deterministic("alpha_home", beta_home + delta_home)
+
+    return model, grid
+
+
+# Variables kept in the trace (the random-walk innovations are not needed after sampling,
+# and dropping them keeps saved fits small)
+KEEP_VARS = ["tau_off", "tau_def", "tau_off_summer", "tau_def_summer", "tau_beta0", "tau_delta0",
+             "tau_beta0_summer", "tau_delta0_summer", "beta0_init", "delta0_init", "beta_home", "delta_home",
+             "log_kappa", "kappa", "sigma_off", "sigma_def", "sigma_phi_off", "sigma_phi_def", "tau", "rho",
+             "alpha_home", "phi_off", "phi_def", "beta0_path", "delta0_path", "xg_mu_off_path", "xg_mu_def_path"]
+
+
+TARGET_ACCEPT_TV = 0.95      # random-walk steps near tau = 0 need smaller NUTS steps than v1.1 (0.9)
+
+
+def sample_tv(model: pm.Model, seed: int = 42, progressbar: bool = True, **kw):
+    """NUTS as hierarchical.sample (cores=1), storing only KEEP_VARS."""
+    from src.models.stochastic.hierarchical import DRAWS, TUNE, CHAINS
+    with model:
+        return pm.sample(draws=kw.get("draws", DRAWS), tune=kw.get("tune", TUNE), chains=kw.get("chains", CHAINS),
+                         cores=1, target_accept=kw.get("target_accept", TARGET_ACCEPT_TV), random_seed=seed,
+                         progressbar=progressbar, var_names=KEEP_VARS)
+
+
+def compact_paths(idata) -> None:
+    """Store the rating paths as float32 before saving (halves the file; plenty of precision)."""
+    post = idata.posterior
+    for name in ["beta0_path", "delta0_path", "xg_mu_off_path", "xg_mu_def_path"]:
+        da = post[name].astype("float32")
+        try:
+            post[name] = da
+        except TypeError:
+            idata["posterior"][name] = da
+
+
+# ---------------------------------------------------------------------------
+# Ratings at the window end (what predictions use)
+# ---------------------------------------------------------------------------
+
+def _set_posterior(idata, name, values, dims):
+    """Add a variable to the posterior (works for ArviZ InferenceData and DataTree)."""
+    import xarray as xr
+    post = idata.posterior
+    coords = {d: post.coords[d] for d in dims if d in post.coords}
+    da = xr.DataArray(values, dims=dims, coords=coords)
+    try:
+        post[name] = da
+    except TypeError:                                     # DataTree node
+        idata["posterior"][name] = da
+
+
+def add_current_ratings(idata, grid: dict, end, seed: int = 0) -> None:
+    """Step every posterior draw from the last step to `end` and save goal-scale
+    ratings under the v1 names: alpha0, mu_off, mu_def (alpha_home is already there).
+
+    The gap is measured from the middle of the last step; an off-season step is used if
+    it is longer than SEASON_GAP_DAYS (a pre-season fit), otherwise in-season drift.
+    """
+    rng = np.random.default_rng(seed)
+    post = idata.posterior
+    gap = max((pd.Timestamp(end).normalize() - pd.Timestamp(grid["mid"][-1])).days, 0)
+    summer = gap > SEASON_GAP_DAYS
+
+    def step(cur, tau_in, tau_summer, zero_sum=False):
+        s = post[tau_summer].values if summer else post[tau_in].values * np.sqrt(gap / 7.0)
+        noise = rng.standard_normal(cur.shape)
+        if zero_sum:
+            noise = noise - noise.mean(axis=-1, keepdims=True)
+            s = s[..., None]
+        return cur + s * noise
+
+    beta0 = step(post["beta0_path"].values[:, :, -1], "tau_beta0", "tau_beta0_summer")
+    delta0 = step(post["delta0_path"].values[:, :, -1], "tau_delta0", "tau_delta0_summer")
+    off = step(post["xg_mu_off_path"].values[:, :, -1, :], "tau_off", "tau_off_summer", zero_sum=True)
+    dfn = step(post["xg_mu_def_path"].values[:, :, -1, :], "tau_def", "tau_def_summer", zero_sum=True)
+
+    _set_posterior(idata, "alpha0", beta0 + delta0, ("chain", "draw"))
+    _set_posterior(idata, "mu_off", off + post["phi_off"].values, ("chain", "draw", "team"))
+    _set_posterior(idata, "mu_def", dfn + post["phi_def"].values, ("chain", "draw", "team"))
+    idata.posterior.attrs.update({"ratings_as_of": str(pd.Timestamp(end).date()),
+                                  "days_after_last_step": int(gap), "crosses_off_season": int(summer),
+                                  "step_days": int(grid["step_days"]), "first_game": str(pd.Timestamp(grid["start"][0]).date())})
+
+
+# ---------------------------------------------------------------------------
+# Scoring rates of the fit games at the time they were played
+# ---------------------------------------------------------------------------
+# late_game (OT factor) and score_state (score effects, simulator scale) compare real games
+# with each game's expected scoring rate. With time-varying ratings that rate must come from
+# the ratings as they were on the game's date, not from today's.
+
+PATH_VARS = ["beta0_path", "delta0_path", "xg_mu_off_path", "xg_mu_def_path", "phi_off", "phi_def"]
+
+
+def is_time_varying(post_or_draws) -> bool:
+    return "xg_mu_off_path" in post_or_draws
+
+
+def add_paths(draws: dict, post) -> dict:
+    """Add pooled path draws (and step_days) to a draws dict, if the fit has them."""
+    if not is_time_varying(post):
+        return draws
+    for name in PATH_VARS:
+        x = post[name].values
+        draws[name] = x.reshape(-1, *x.shape[2:])
+    draws["step_days"] = int(post.attrs.get("step_days", STEP_DAYS))
+    return draws
+
+
+def game_steps(gt: pd.DataFrame, step_days: int) -> np.ndarray:
+    """Step index of each game: the same grid the fit used, provided gt is the fit's games."""
+    return time_grid(gt["game_date"], step_days)["step"]
+
+
+def game_rates(d: dict, gt: pd.DataFrame, draw_idx=None, reps: int = 1):
+    """Regulation scoring rates (lam_home, lam_away) for the fit games, from the paths.
+
+    d: draws dict with paths (add_paths) plus alpha_home. draw_idx: one posterior draw per
+    game (length reps * len(gt), games tiled reps times); None = posterior means (plug-in).
+    """
+    k = np.tile(game_steps(gt, d["step_days"]), reps)
+    hi, ai = np.tile(gt["home_idx"].to_numpy(), reps), np.tile(gt["away_idx"].to_numpy(), reps)
+    gh, ga = np.tile(gt["gamma_home"].to_numpy(), reps), np.tile(gt["gamma_away"].to_numpy(), reps)
+    if draw_idx is None:
+        m = {n: d[n].mean(axis=0) for n in PATH_VARS + ["alpha_home"]}
+        lvl = m["beta0_path"][k] + m["delta0_path"][k]
+        lam_h = np.exp(lvl + m["alpha_home"] + m["xg_mu_off_path"][k, hi] + m["phi_off"][hi]
+                       - m["xg_mu_def_path"][k, ai] - m["phi_def"][ai] - ga)
+        lam_a = np.exp(lvl + m["xg_mu_off_path"][k, ai] + m["phi_off"][ai]
+                       - m["xg_mu_def_path"][k, hi] - m["phi_def"][hi] - gh)
+        return lam_h, lam_a
+    j = np.asarray(draw_idx)
+    lvl = d["beta0_path"][j, k] + d["delta0_path"][j, k]
+    lam_h = np.exp(lvl + d["alpha_home"][j] + d["xg_mu_off_path"][j, k, hi] + d["phi_off"][j, hi]
+                   - d["xg_mu_def_path"][j, k, ai] - d["phi_def"][j, ai] - ga)
+    lam_a = np.exp(lvl + d["xg_mu_off_path"][j, k, ai] + d["phi_off"][j, ai]
+                   - d["xg_mu_def_path"][j, k, hi] - d["phi_def"][j, hi] - gh)
+    return lam_h, lam_a
+
+
+# ---------------------------------------------------------------------------
+# Synthetic league with known drifting ratings (recovery test)
+# ---------------------------------------------------------------------------
+
+def simulate_league_tv(n_teams: int = 16, seasons: int = 2, games_per_team: int = 60,
+                       sigma: float = 0.08, tau_week: float = 0.015, tau_summer: float = 0.06,
+                       tau_league_week: float = 0.004, tau_league_summer: float = 0.03,
+                       beta0: float = np.log(2.6), beta_home: float = 0.05, delta0: float = 0.0,
+                       kappa: float = 9.0, rho: float = 0.5, season_days: int = 180,
+                       off_season_days: int = 150, seed: int = 0):
+    """Fake league with drifting team and league levels, in game-table format.
+
+    Truth is daily random walks (tau's are per week, scaled by sqrt(days / 7)).
+    Returns (gt, teams, truth) with truth paths by day.
+    """
+    rng = np.random.default_rng(seed)
+    teams = [f"T{i:02d}" for i in range(n_teams)]
+    days = []
+    for s in range(seasons):
+        start = s * (season_days + off_season_days)
+        days.extend(range(start, start + season_days))
+    days = np.array(days)
+    D = days.max() + 1
+
+    def walk(dim, t_week, t_summer, init):
+        x = np.zeros((D,) + dim)
+        x[0] = init
+        for d in range(1, D):
+            summer_start = any(d == s * (season_days + off_season_days) for s in range(1, seasons))
+            step = (t_summer if summer_start else 0.0) + (0.0 if summer_start else t_week / np.sqrt(7))
+            if d in days or summer_start:
+                inc = rng.standard_normal(dim) * step
+                if dim:
+                    inc -= inc.mean()
+                x[d] = x[d - 1] + inc
+            else:
+                x[d] = x[d - 1]
+        return x
+
+    off = walk((n_teams,), tau_week, tau_summer, rng.normal(0, sigma, n_teams))
+    dfn = walk((n_teams,), tau_week, tau_summer, rng.normal(0, sigma, n_teams))
+    off -= off.mean(axis=1, keepdims=True); dfn -= dfn.mean(axis=1, keepdims=True)
+    b0 = walk((), tau_league_week, tau_league_summer, beta0)
+    d0 = walk((), tau_league_week, tau_league_summer, delta0)
+
+    n_games = n_teams * games_per_team * seasons // 2
+    gd = np.sort(rng.choice(days, n_games))
+    home = rng.integers(0, n_teams, n_games)
+    away = (home + rng.integers(1, n_teams, n_games)) % n_teams
+    gh, ga = rng.normal(0, 0.03, n_games), rng.normal(0, 0.03, n_games)
+    nu_h = np.exp(b0[gd] + beta_home + off[gd, home] - dfn[gd, away])
+    nu_a = np.exp(b0[gd] + off[gd, away] - dfn[gd, home])
+    xg_h, xg_a = rng.gamma(kappa, nu_h / kappa), rng.gamma(kappa, nu_a / kappa)
+    lam_h = nu_h * np.exp(d0[gd] - ga)
+    lam_a = nu_a * np.exp(d0[gd] - gh)
+    y_h, y_a = sample_scores(lam_h, lam_a, rho, rng)
+
+    date0 = pd.Timestamp("2000-10-01")
+    gt = pd.DataFrame({
+        "game_id": np.arange(n_games), "game_date": date0 + pd.to_timedelta(gd, unit="D"),
+        "season": gd // (season_days + off_season_days),
+        "home": [teams[i] for i in home], "away": [teams[i] for i in away],
+        "home_idx": home, "away_idx": away,
+        "home_goals": y_h, "away_goals": y_a, "home_goals_reg": y_h, "away_goals_reg": y_a,
+        "home_xg_reg": xg_h, "away_xg_reg": xg_a,
+        "home_goalie": 0, "away_goalie": 0, "gamma_home": gh, "gamma_away": ga,
+    })
+    truth = {"off": off, "def": dfn, "beta0": b0, "delta0": d0, "date0": date0,
+             "tau_week": tau_week, "tau_summer": tau_summer}
+    return gt, teams, truth

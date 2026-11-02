@@ -23,9 +23,9 @@ from config.settings import OUTPUT_DIR
 POSTERIOR_DIR = OUTPUT_DIR / "posteriors"
 ACTIVE_PATH = POSTERIOR_DIR / "active_fit.json"
 
-# Production defaults: the model Phase 7 adopted
-DEFAULT_MODEL = "xg"          # Track B v1.1 (ratings from xG + goals)
-DEFAULT_WINDOW_DAYS = 365     # 1-year window
+# Production defaults: v2.0 adopted 2026-11-01 (beat v1.1 in the walk-forward backtest)
+DEFAULT_MODEL = "tv"          # Track B v2.0 (time-varying ratings, weekly steps); "xg" = v1.1
+DEFAULT_WINDOW_DAYS = 365     # v1 / v1.1 window; v2.0 uses 730 (fit_hierarchical DEFAULT_TV_WINDOW)
 DEFAULT_HALF_LIFE = None      # no recency weighting
 
 

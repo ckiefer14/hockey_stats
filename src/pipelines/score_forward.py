@@ -12,7 +12,7 @@ Usage (from the project root, after load_all.py has loaded the results):
 For each game, the prediction scored is the last one made on or before the game date
 (so a re-prediction with confirmed starters counts; one made after the game never does).
 Reports log loss, Brier, accuracy, calibration slope (with 90% bootstrap ranges) next to
-the historical home-win rate and the Phase 7 backtest, calibration by probability bin,
+the historical home-win rate, the betting market (if log_odds.py has run) and the Phase 7 backtest, calibration by probability bin,
 results by week, score outputs, and how often the default starting goalie was right.
 Writes output/forward/scored_<season>.csv.
 """
@@ -24,7 +24,8 @@ import pandas as pd
 
 from config.settings import OUTPUT_DIR
 from src.data.db import get_connection
-from src.validation.scoring import score_models, calibration_table, score_outputs, log_loss
+from src.validation.scoring import score_models, calibration_table, score_outputs, log_loss, paired_difference
+from src.data.odds import consensus
 
 FORWARD_DIR = OUTPUT_DIR / "forward"
 BACKTEST_LOG_LOSS = 0.6773          # Phase 7: Track B v1.1, 1-yr window, 2,624 held-out games
@@ -94,6 +95,28 @@ def main():
     print(f"Live log loss {ll:.4f} ± {1.645 * se:.4f} (90%); Phase 7 backtest {BACKTEST_LOG_LOSS:.4f}; coin flip {COIN_FLIP:.4f}")
     if len(df) < 300:
         print(f"Only {len(df)} games: the range is wide. Differences of 0.005 need roughly 1,000+ games to show.")
+
+    # 1b. The betting market (log_odds.py): last snapshot before each game, margin removed
+    odds_path = FORWARD_DIR / f"odds_{season}.csv"
+    if odds_path.exists():
+        mk = consensus(pd.read_csv(odds_path), before_start=True)
+        dm = df.merge(mk, on="game_id", how="inner")
+        print(f"\nVs the betting market ({len(dm):,} of {len(df):,} games have a pre-game line; "
+              f"median of {dm['books'].median():.0f} books, margin removed):" if len(dm) else
+              "\nVs the betting market: no pre-game lines for the scored games yet.")
+        if len(dm):
+            t = score_models(dm, {"Track B (live)": "p_home", "Market": "p_market", "Home rate": "p_home_rate"},
+                             reference="Market", n_boot=1000)
+            print(t.drop(columns=["games", "intercept"]).round(4).to_string(index=False))
+            d = paired_difference(dm, "p_home", "p_market")
+            print(f"Model minus market log loss {d['difference']:+.4f} (90% {d['lo']:+.4f} to {d['hi']:+.4f}); "
+                  f"negative = model better. Mean |model - market| {100 * (dm['p_home'] - dm['p_market']).abs().mean():.1f} pts")
+            big = dm[(dm["p_home"] - dm["p_market"]).abs() >= 0.05]
+            if len(big):
+                print(f"Games where model and market differ by 5+ pts: {len(big)}; log loss there "
+                      f"model {log_loss(big['p_home'], big['home_won']):.4f} vs market "
+                      f"{log_loss(big['p_market'], big['home_won']):.4f}")
+            df = df.merge(mk[["game_id", "p_market"]], on="game_id", how="left")
 
     # 2. Calibration by probability bin
     bins = 5 if len(df) < 400 else 10

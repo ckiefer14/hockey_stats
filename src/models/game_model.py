@@ -51,6 +51,8 @@ def load_track_b(path) -> tuple[dict, list[str]]:
     for name in LEAGUE_TERMS + TEAM_TERMS:
         x = post[name].values
         draws[name] = x.reshape(-1, *x.shape[2:])
+    from src.models.stochastic.hierarchical_tv import add_paths
+    add_paths(draws, post)                    # v2.0 fits: rating paths too (for late_game / score_state)
     teams = str(post.attrs["teams"]).split(",")
     return draws, teams
 

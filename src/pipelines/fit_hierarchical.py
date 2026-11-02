@@ -9,6 +9,9 @@ Usage (from the project root):
     py -m src.pipelines.fit_hierarchical                      # v1.1, last 365 days of data (Phase 7 choice)
     py -m src.pipelines.fit_hierarchical --end 2026-12-01     # window ends the day before this date
     py -m src.pipelines.fit_hierarchical --model goals --window 730   # Track B v1, for comparison
+    py -m src.pipelines.fit_hierarchical --model tv                   # Track B v2.0, 730 days, weekly steps
+    py -m src.pipelines.fit_hierarchical --model tv --step-days 2     # v2.0 with about one step per game
+    py -m src.pipelines.fit_hierarchical --model tv --draws 2000      # longer run: cleaner R-hat / ESS
     py -m src.pipelines.fit_hierarchical --overwrite
 
 Model and window match the Phase 7 backtest: the fit uses games with
@@ -49,6 +52,7 @@ from src.models.stochastic.hierarchical import (
     GOAL_COLS, DRAWS, TUNE, CHAINS, TARGET_ACCEPT, build_model, sample, team_ratings,
 )
 from src.models.stochastic.hierarchical_xg import build_model_xg, XG_COLS
+from src.models.stochastic import hierarchical_tv as htv
 from src.models.stochastic.am_sampler import plot_traces
 from src.models.active_fit import (
     POSTERIOR_DIR, DEFAULT_MODEL, DEFAULT_WINDOW_DAYS, DEFAULT_HALF_LIFE, write_active,
@@ -62,7 +66,13 @@ LEAGUE_TERMS_BY_MODEL = {
     "goals": ["alpha0", "alpha_home", "sigma_off", "sigma_def", "rho"],
     "xg":    ["alpha0", "alpha_home", "sigma_off", "sigma_def", "sigma_phi_off", "sigma_phi_def",
               "kappa", "rho"],
+    "tv":    ["alpha0", "alpha_home", "sigma_off", "sigma_def", "tau_off", "tau_def",
+              "tau_off_summer", "tau_def_summer", "tau_beta0", "tau_delta0",
+              "tau_beta0_summer", "tau_delta0_summer", "sigma_phi_off", "sigma_phi_def", "kappa", "rho"],
 }
+TEAM_TERMS_BY_MODEL = {"goals": ["mu_off", "mu_def"], "xg": ["mu_off", "mu_def"],
+                       "tv": ["xg_mu_off_path", "xg_mu_def_path"]}   # v2.0: check the whole paths
+DEFAULT_TV_WINDOW = 730       # v2.0: old games are no longer treated as current, so use 2 years
 LEAGUE_TERMS = LEAGUE_TERMS_BY_MODEL["goals"]      # default for notebooks that import diagnostics()
 TEAM_TERMS = ["mu_off", "mu_def"]
 
@@ -73,10 +83,9 @@ MIN_BFMI = 0.3
 
 
 def rhat_ess(post, name: str) -> tuple[float, float]:
-    """Worst R-hat and smallest ESS for one variable (scalar or one per team)."""
-    x = post[name].values                         # (chain, draw) or (chain, draw, team)
-    if x.ndim == 2:
-        x = x[:, :, None]
+    """Worst R-hat and smallest ESS for one variable (scalar, per team, or per step and team)."""
+    x = post[name].values                         # (chain, draw, ...)
+    x = x.reshape(x.shape[0], x.shape[1], -1)
     rhats = [float(az.rhat(x[:, :, i])) for i in range(x.shape[2])]
     esses = [float(az.ess(x[:, :, i])) for i in range(x.shape[2])]
     return max(rhats), min(esses)
@@ -171,6 +180,13 @@ def unscored_games(conn, start, end=None) -> pd.DataFrame:
 
 
 def priors(model: str) -> dict:
+    if model == "tv":
+        return {
+            **priors("xg"),
+            "tau (weekly random-walk step) halfnormal sd: teams / league": [htv.TAU_TEAM_PRIOR, htv.TAU_LEAGUE_PRIOR],
+            "tau_summer (off-season step) halfnormal sd: teams / league": [htv.TAU_TEAM_SUMMER_PRIOR,
+                                                                           htv.TAU_LEAGUE_SUMMER_PRIOR],
+        }
     if model == "xg":
         return {
             "beta0 (log xG per team-game)": {"mean": float(hx.BETA0_PRIOR[0]), "sd": hx.BETA0_PRIOR[1]},
@@ -195,10 +211,16 @@ def main():
     matplotlib.use("Agg")
 
     parser = argparse.ArgumentParser(description="Fit Track B on a training window and make it the active fit.")
-    parser.add_argument("--model", choices=["goals", "xg"], default=DEFAULT_MODEL,
-                        help="xg = Track B v1.1 (default, Phase 7 choice); goals = Track B v1")
-    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_DAYS,
-                        help=f"training window in days (default {DEFAULT_WINDOW_DAYS})")
+    parser.add_argument("--model", choices=["goals", "xg", "tv"], default=DEFAULT_MODEL,
+                        help="xg = Track B v1.1 (default, Phase 7 choice); goals = Track B v1; "
+                             "tv = Track B v2.0 (time-varying ratings)")
+    parser.add_argument("--window", type=int, default=None,
+                        help=f"training window in days (default {DEFAULT_WINDOW_DAYS}; {DEFAULT_TV_WINDOW} for tv)")
+    parser.add_argument("--draws", type=int, default=DRAWS,
+                        help=f"posterior draws per chain (default {DRAWS}; 2000 gives cleaner R-hat / ESS, about 2x time)")
+    parser.add_argument("--tune", type=int, default=TUNE, help=f"tuning steps per chain (default {TUNE})")
+    parser.add_argument("--step-days", type=int, default=htv.STEP_DAYS,
+                        help="v2.0 only: days per random-walk step (7 = weekly, 2 = about one per game)")
     parser.add_argument("--half-life", type=float, default=DEFAULT_HALF_LIFE,
                         help="v1.1 only: recency half-life in days (default none)")
     parser.add_argument("--end", default=None,
@@ -209,6 +231,8 @@ def main():
     args = parser.parse_args()
     if args.half_life and args.model != "xg":
         raise SystemExit("--half-life is only supported with --model xg")
+    if args.window is None:
+        args.window = DEFAULT_TV_WINDOW if args.model == "tv" else DEFAULT_WINDOW_DAYS
 
     # 1. Data and window
     conn = get_connection()
@@ -236,7 +260,7 @@ def main():
     seasons = sorted(gt["season"].astype(str).unique())
 
     # 2. Paths and overwrite protection
-    label = model_label(args.model, args.window, args.half_life)
+    label = model_label(args.model, args.window, args.half_life, args.step_days)
     POSTERIOR_DIR.mkdir(parents=True, exist_ok=True)
     stem = POSTERIOR_DIR / f"{label}_{end:%Y%m%d}"
     nc_path = stem.with_suffix(".nc")
@@ -251,24 +275,33 @@ def main():
     print(f"Regulation goals/game: home {gt[hg].mean():.3f}, away {gt[ag].mean():.3f}; "
           f"tied after regulation: {(gt[hg] == gt[ag]).mean():.1%}; "
           f"games with a goalie at gamma = 0: {no_history:.1%}")
-    if args.model == "xg":
+    if args.model in ("xg", "tv"):
         hx_, ax_ = XG_COLS
         print(f"Regulation xG/game: home {gt[hx_].mean():.3f}, away {gt[ax_].mean():.3f}")
 
     # 3. Fit
-    if args.model == "xg":
+    grid = None
+    if args.model == "tv":
+        model, grid = htv.build_model_tv(gt, teams, step_days=args.step_days)
+        print(f"Time steps: {len(grid['gap_days'])} of {args.step_days} days "
+              f"({int(grid['summer'].sum())} off-season)")
+    elif args.model == "xg":
         model = build_model_xg(gt, teams, half_life_days=args.half_life, ref_date=end)
     else:
         model = build_model(gt, teams)
-    print(f"Sampling {CHAINS} chains ({TUNE:,} tune + {DRAWS:,} draws each)...")
-    idata = sample(model, seed=RANDOM_SEED)
+    print(f"Sampling {CHAINS} chains ({args.tune:,} tune + {args.draws:,} draws each)...")
+    if grid is not None:
+        idata = htv.sample_tv(model, seed=RANDOM_SEED, draws=args.draws, tune=args.tune)
+        htv.add_current_ratings(idata, grid, end, seed=RANDOM_SEED)     # ratings as of the window end
+    else:
+        idata = sample(model, seed=RANDOM_SEED, draws=args.draws, tune=args.tune)
 
     # 4. Diagnose
     league_terms = LEAGUE_TERMS_BY_MODEL[args.model]
-    diag = diagnostics(idata, league_terms)
+    diag = diagnostics(idata, league_terms, TEAM_TERMS_BY_MODEL[args.model])
 
     # 5. Save posterior (settings travel with the samples)
-    model_name = "track_b_v1.1_xg" if args.model == "xg" else "track_b_v1_goals"
+    model_name = {"xg": "track_b_v1.1_xg", "tv": "track_b_v2.0_tv"}.get(args.model, "track_b_v1_goals")
     idata.posterior.attrs.update({
         "model": model_name,
         "label": label,
@@ -277,6 +310,8 @@ def main():
         "window_end": str(end.date()),
         "teams": ",".join(teams),
     })
+    if grid is not None:
+        htv.compact_paths(idata)
     saved = save_netcdf(idata, nc_path)
 
     # 6. Ratings table (goal scale: what the game model uses)
@@ -294,6 +329,7 @@ def main():
         "label": label,
         "window_days": args.window,
         "half_life_days": args.half_life,
+        "step_days": args.step_days if args.model == "tv" else None,
         "window_start": str(start.date()),
         "window_end_excluded": str(end.date()),
         "seasons": seasons,
@@ -303,14 +339,17 @@ def main():
         "first_game": str(gt["game_date"].min().date()),
         "last_game": str(gt["game_date"].max().date()),
         "likelihood": ("Gamma on regulation xG (mean nu, shape kappa) + tie-inflated Poisson on regulation goals "
-                       "with finishing effects phi" if args.model == "xg"
+                       "with finishing effects phi" + ("; team ratings and league levels follow random walks "
+                       "(zero-sum team steps, separate off-season step)" if args.model == "tv" else "")
+                       if args.model in ("xg", "tv")
                        else "tie-inflated Poisson (rho multiplies tied regulation scores by 1 + rho)"),
         "goals_target": "regulation goals (periods 1-3, empty-net goals excluded): " + ", ".join(GOAL_COLS),
         "goalie_input": "fixed gamma = -log(theta_mean), Phase 3 rating of the starter as of game date (goals only)",
         "share_games_gamma_zero": no_history,
         "priors": priors(args.model),
-        "sampler": {"name": "NUTS", "chains": CHAINS, "tune": TUNE, "draws": DRAWS,
-                    "target_accept": TARGET_ACCEPT, "seed": RANDOM_SEED},
+        "sampler": {"name": "NUTS", "chains": CHAINS, "tune": args.tune, "draws": args.draws,
+                    "target_accept": htv.TARGET_ACCEPT_TV if args.model == "tv" else TARGET_ACCEPT,
+                    "seed": RANDOM_SEED},
         "diagnostics": diag,
         "fitted_at": datetime.now().isoformat(timespec="seconds"),
         "versions": {"numpy": np.__version__, "pymc": pm.__version__, "arviz": az.__version__},
@@ -326,6 +365,7 @@ def main():
             "label": label,
             "window_days": args.window,
             "half_life_days": args.half_life,
+            "step_days": args.step_days if args.model == "tv" else None,
             "start": str(start.date()),
             "end": str(end.date()),
             "seasons": seasons,

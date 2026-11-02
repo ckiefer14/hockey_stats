@@ -1,7 +1,8 @@
 """
 backtest.py
 ===========
-Walk-forward backtest of the Track B game model (v1 goals-only, or v1.1 xG + goals):
+Walk-forward backtest of the Track B game model (v1 goals-only, v1.1 xG + goals, or
+v2.0 time-varying ratings):
 every game is predicted using only data from before it.
 
 Home: src/validation/backtest.py
@@ -31,6 +32,7 @@ from src.processing.late_game import late_game_params
 from src.processing.score_state import score_state_params
 from src.models.stochastic.hierarchical import build_model, sample
 from src.models.stochastic.hierarchical_xg import build_model_xg
+from src.models.stochastic.hierarchical_tv import build_model_tv, add_current_ratings, add_paths, sample_tv, STEP_DAYS
 from src.models.game_model import outcome_probs
 from src.models.stochastic.montecarlo import simulate_games_score_state, calibrate_scale
 
@@ -46,7 +48,7 @@ def draws_from_idata(idata) -> dict:
     for name in LEAGUE_TERMS + ["mu_off", "mu_def"]:
         x = post[name].values
         out[name] = x.reshape(-1, *x.shape[2:])
-    return out
+    return add_paths(out, post)          # v2.0: rating paths (rates of past games)
 
 
 def with_new_teams(draws: dict, teams: list[str], needed) -> tuple[dict, list[str]]:
@@ -62,14 +64,21 @@ def with_new_teams(draws: dict, teams: list[str], needed) -> tuple[dict, list[st
 
 
 def fit_window(gt_all: pd.DataFrame, end, window_days: int, seed: int,
-               model: str = "goals", half_life: float | None = None):
+               model: str = "goals", half_life: float | None = None, step_days: int = STEP_DAYS):
     """Fit Track B on the window_days before `end`. Returns (idata, window_gt, teams).
 
-    model: "goals" (v1, goals only) or "xg" (v1.1, ratings from xG + goals).
+    model: "goals" (v1, goals only), "xg" (v1.1, ratings from xG + goals) or
+           "tv" (v2.0, v1.1 with ratings and league levels that drift over time).
     half_life: v1.1 only; game weight 0.5 ** (age_days / half_life), age measured to `end`.
+    step_days: v2.0 only; length of a random-walk step (7 = weekly, 2 = about one per game).
     """
     end = pd.Timestamp(end)
     w, teams = select_window(gt_all, end - pd.Timedelta(days=window_days), end)
+    if model == "tv":
+        m, grid = build_model_tv(w, teams, step_days=step_days)
+        idata = sample_tv(m, seed=seed, progressbar=False)
+        add_current_ratings(idata, grid, end, seed=seed)     # ratings stepped forward to `end`
+        return idata, w, teams
     if model == "xg":
         m = build_model_xg(w, teams, half_life_days=half_life, ref_date=end)
     else:
@@ -78,10 +87,14 @@ def fit_window(gt_all: pd.DataFrame, end, window_days: int, seed: int,
     return idata, w, teams
 
 
-def model_label(model: str, window_days: int, half_life: float | None) -> str:
-    """Name used in result files and the notebook, e.g. trackb_w730, trackbxg_w365_hl120."""
-    name = "trackbxg" if model == "xg" else "trackb"
-    return f"{name}_w{window_days}" + (f"_hl{int(half_life)}" if half_life else "")
+def model_label(model: str, window_days: int, half_life: float | None, step_days: int = STEP_DAYS) -> str:
+    """Name used in result files and the notebook, e.g. trackb_w730, trackbxg_w365_hl120,
+    trackbtv_w730 (weekly steps), trackbtv_w730_s2 (2-day steps)."""
+    name = {"xg": "trackbxg", "tv": "trackbtv"}.get(model, "trackb")
+    label = f"{name}_w{window_days}" + (f"_hl{int(half_life)}" if half_life else "")
+    if model == "tv" and step_days != STEP_DAYS:
+        label += f"_s{int(step_days)}"
+    return label
 
 
 def predict_block(games: pd.DataFrame, draws: dict, teams: list[str], late: dict, ss: dict,
@@ -137,7 +150,8 @@ def predict_block(games: pd.DataFrame, draws: dict, teams: list[str], late: dict
 
 def walk_forward(conn, season: str, window_days: int = 730, refit_days: int = 7,
                  score_sims: int = 5000, seed: int = 42, out_path=None, all_seasons=None,
-                 verbose: bool = True, model: str = "goals", half_life: float | None = None) -> pd.DataFrame:
+                 verbose: bool = True, model: str = "goals", half_life: float | None = None,
+                 step_days: int = STEP_DAYS) -> pd.DataFrame:
     """Walk-forward predictions for every regular-season game of `season`.
 
     out_path: CSV to append to after each refit block; games already in it are skipped.
@@ -158,11 +172,15 @@ def walk_forward(conn, season: str, window_days: int = 730, refit_days: int = 7,
         done = set(pd.read_csv(out_path, usecols=["game_id"])["game_id"])
         if verbose:
             print(f"Resuming: {len(done):,} games already in {out_path}")
+    if test["game_id"].isin(done).all():
+        if verbose:
+            print("All games already predicted; nothing to fit.")
+        return pd.DataFrame()
 
     # 1. Pre-season fit: late-game and score-state parameters from prior games only
     if verbose:
         print(f"Pre-season fit: {window_days} days before {opening.date()}")
-    idata0, w0, _ = fit_window(gt_all, opening, window_days, seed, model, half_life)
+    idata0, w0, _ = fit_window(gt_all, opening, window_days, seed, model, half_life, step_days)
     late = late_game_params(conn, w0, idata0.posterior)
     ss = score_state_params(conn, w0, idata0.posterior)
     ss["scale"] = calibrate_scale(draws_from_idata(idata0), None, ss, w0)
@@ -183,11 +201,11 @@ def walk_forward(conn, season: str, window_days: int = 730, refit_days: int = 7,
         if len(block):
             block_no += 1
             idata, w, teams = (idata0, w0, sorted(set(w0["home"]) | set(w0["away"]))) if refit == opening.normalize() \
-                else fit_window(gt_all, refit, window_days, seed + block_no, model, half_life)
+                else fit_window(gt_all, refit, window_days, seed + block_no, model, half_life, step_days)
             pred = predict_block(block, draws_from_idata(idata), teams, late, ss, rng, score_sims)
             pred = block[["game_id", "game_date", "season", "home", "away", "home_goalie", "away_goalie",
                           "gamma_home", "gamma_away", "home_goals_reg", "away_goals_reg"]].merge(pred, on="game_id")
-            pred.insert(0, "model", model_label(model, window_days, half_life))
+            pred.insert(0, "model", model_label(model, window_days, half_life, step_days))
             pred["refit_date"] = refit.date()
             pred["train_games"] = len(w)
             divs = int(idata.sample_stats["diverging"].values.sum())

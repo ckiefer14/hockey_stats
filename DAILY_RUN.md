@@ -10,9 +10,12 @@ py .\scripts\load_all.py
 py -m src.pipelines.score_xg --season 20262027
 py -m src.pipelines.make_cards postgame --pending
 
-# 2. Today: predictions + pregame cards
+# 2. Today: predictions + pregame cards, then the market's lines for the same games
 py -m src.pipelines.predict_day
+py -m src.pipelines.log_odds
 ```
+
+- Optional: run `py -m src.pipelines.log_odds` again shortly before the first game. Scoring uses each game's **last line taken before it started**, so a later snapshot is closer to the closing line (1 credit per run; the free plan has 500 a month).
 
 - `score_xg` must run before the postgame cards (they need each shot's xG).
 - `predict_day` goes last so it uses the newest goalie history.
@@ -27,16 +30,27 @@ py -m src.pipelines.make_cards postgame --pending
 
 # Weekly: grade the forward test, then refit
 py -m src.pipelines.score_forward
-py -m src.pipelines.fit_hierarchical
+py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 (default): ~12 min
 py -m src.processing.late_game
 py -m src.processing.score_state
 py -m src.pipelines.build_pce            # optional: refresh the Phase 8 indices
 
 # 2. Today
 py -m src.pipelines.predict_day
+py -m src.pipelines.log_odds
 ```
 
+The fit is Track B v2.0 (time-varying ratings, 730-day window, weekly steps). `--draws 2000` keeps R-hat and ESS clean; `--model xg` fits v1.1 instead. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
+
 Refit in the **morning**, not at night: a fit made after a day's games includes them, so that day can no longer be predicted.
+
+## Odds logging (one-time setup)
+
+1. Get a free API key at https://the-odds-api.com.
+2. Create a file named `.env` in the project root containing one line: `ODDS_API_KEY=your_key` (it is gitignored, so the key never reaches GitHub).
+3. `py -m src.pipelines.log_odds` prints each game's market P(home win) (median over books, margin removed) next to the model's, and appends to `output/forward/odds_<season>.csv`. `--markets h2h,totals,spreads` also logs totals and puck lines (3 credits).
+
+`score_forward` then adds a **model vs market** section: log loss for both on the same games, the paired difference with a 90% range, and how each did on games where they disagree by 5+ points.
 
 ## Re-predicting a game (`--replace`)
 
@@ -74,5 +88,6 @@ py -m src.pipelines.predict_day --replace          # re-predict every game today
 |---|---|
 | Predictions log | `output/forward/predictions_20262027.csv` |
 | Scored predictions | `output/forward/scored_20262027.csv` |
+| Odds log | `output/forward/odds_20262027.csv` |
 | Cards | `output/game_summaries/<date>/<away>_at_<home>_<pregame\|postgame>.png` |
 | Active fit | `output/posteriors/active_fit.json` |

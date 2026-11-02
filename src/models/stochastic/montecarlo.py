@@ -267,9 +267,13 @@ def calibrate_scale(draws: dict, late: dict, ss: dict, gt: pd.DataFrame,
     hi, ai = np.tile(gt["home_idx"].to_numpy(), reps), np.tile(gt["away_idx"].to_numpy(), reps)
     gh, ga = np.tile(gt["gamma_home"].to_numpy(), reps), np.tile(gt["gamma_away"].to_numpy(), reps)
     draw_idx = rng.integers(0, draws["alpha0"].size, hi.size)
-    a0, ah = draws["alpha0"][draw_idx], draws["alpha_home"][draw_idx]
-    lam_h = np.exp(a0 + ah + draws["mu_off"][draw_idx, hi] - draws["mu_def"][draw_idx, ai] - ga)
-    lam_a = np.exp(a0 + draws["mu_off"][draw_idx, ai] - draws["mu_def"][draw_idx, hi] - gh)
+    if "xg_mu_off_path" in draws:             # v2.0: ratings as of each game's date
+        from src.models.stochastic.hierarchical_tv import game_rates
+        lam_h, lam_a = game_rates(draws, gt, draw_idx=draw_idx, reps=reps)
+    else:
+        a0, ah = draws["alpha0"][draw_idx], draws["alpha_home"][draw_idx]
+        lam_h = np.exp(a0 + ah + draws["mu_off"][draw_idx, hi] - draws["mu_def"][draw_idx, ai] - ga)
+        lam_a = np.exp(a0 + draws["mu_off"][draw_idx, ai] - draws["mu_def"][draw_idx, hi] - gh)
     target = (lam_h + lam_a).mean()
 
     scale = 1.0

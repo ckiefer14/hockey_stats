@@ -35,7 +35,8 @@ All of these come from the same underlying machinery — a hierarchical Bayesian
 | 6. Game model + Monte Carlo | **Done** | `predict_game.py`: P(win) with uncertainty from an exact per-draw model (reproduces home win, REG/OT/SO shares of 2024-26); score outputs from a 10-second score-state simulator (pulled goalies, late-game caution) that matches real ties, empty-net share and margins |
 | 7. Validation | **Done** | Walk-forward backtest, 2,624 held-out games (2024-25 + 2025-26). Track B v1.1 (ratings from xG + goals, 1-year window) log loss 0.6773, calibration slope 0.99: clearly beats Track B v1, Elo and home rate; **statistically tied with rolling xG** (0.6754). Recency weighting tested and not adopted. Market comparison waiting on closing-line data |
 | 8. PCE / Sobol | **Done** | What makes P(home win) differ between games: team ratings 95%, home-ice uncertainty 3%, starting goalies 2%, almost no interactions. Ties are driven by tie-inflation uncertainty (55%). PCE and Saltelli agree within 0.0003. Analysis B (one matchup's uncertainty) moved to v2 |
-| v2. Model improvements | Planned | Top item from Phase 7: time-varying team ratings. Then hierarchical xG layer, lineup (player-level) model; see *v2 — Planned Improvements* |
+| v2.0 Time-varying ratings | **Done, live model** | Team ratings and league levels drift week to week. Walk-forward log loss **0.6749** vs v1.1 0.6773 (**−0.0025 [−0.0040, −0.0009], clear**), ties/edges rolling xG (0.6754), calibration slope 0.98; blending with rolling xG no longer clearly helps. Weekly = 2-day steps |
+| v2 (rest) | In progress | Forward test and odds logging running; next v2.0b follow-ups, then hierarchical xG layer, lineup model; see *v2 — Planned Improvements* |
 
 **Check current state:** `py .\scripts\check_state.py` lists which files and tables exist and whether `shot_context` matches the current derivation code.
 
@@ -108,6 +109,7 @@ hockey-stats/
 │   ├── data/                   # data acquisition & storage
 │   │   ├── __init__.py
 │   │   ├── nhl_api.py          # NHL API client
+│   │   ├── odds.py             # DONE: The Odds API client, team-name map, no-vig probabilities, consensus line
 │   │   ├── db.py               # SQLite operations
 │   │   ├── scraper.py          # Natural Stat Trick / Evolving-Hockey scrapers
 │   │   └── cache.py            # caching layer
@@ -145,6 +147,7 @@ hockey-stats/
 │   │       ├── toy_mcmc.py     # Track A: hockey-flavored AM MCMC
 │   │       ├── hierarchical.py # DONE: Track B v1 PyMC model, sample_scores, simulate_league
 │   │       ├── hierarchical_xg.py # DONE: Track B v1.1 (ratings from xG + goals), simulate_league_xg
+│   │       ├── hierarchical_tv.py # DONE: Track B v2.0 (time-varying ratings, live model), simulate_league_tv
 │   │       ├── xg_hierarchical.py # v2: Bayesian layer on top of LightGBM xG
 │   │       ├── lineup_rapm.py  # v2: Bayesian RAPM player effects
 │   │       ├── montecarlo.py   # DONE: tie-inflated and score-state game simulators
@@ -173,6 +176,7 @@ hockey-stats/
 │   │   ├── backtest_season.py  # DONE: py -m src.pipelines.backtest_season --season S [--model xg] [--window D] [--half-life D]
 │   │   ├── run_baselines.py    # DONE: py -m src.pipelines.run_baselines --seasons S1 S2
 │   │   ├── predict_day.py      # DONE: forward test, log every game on a date before it's played
+│   │   ├── log_odds.py         # DONE: log sportsbook moneylines next to the forward test
 │   │   ├── score_forward.py    # DONE: score the forward-test log against played games
 │   │   ├── make_cards.py       # DONE: pregame cards (called by predict_day) and postgame cards (--pending, --date, ids)
 │   │   └── build_pce.py        # DONE: py -m src.pipelines.build_pce [--degree 4]
@@ -974,11 +978,11 @@ Robustness (full observed ranges instead of variance-matched): P(home win) team 
 
 ## v2 — Planned Improvements
 
-Everything in this section comes **after Phase 7**. The baseline each item must beat is Track B v1.1 (1-year window): held-out log loss 0.6773, slope 0.99, tied with rolling xG (0.6754). Each item is kept only if it improves held-out log loss in the Phase 7 walk-forward backtest (`backtest_season.py` + `phase7_check.ipynb`).
+Everything in this section comes **after Phase 7**. The baseline each item must beat is now **Track B v2.0** (held-out log loss 0.6749, slope 0.98); before v2.0 it was v1.1 (0.6773, slope 0.99), tied with rolling xG (0.6754). Each item is kept only if it improves held-out log loss in the Phase 7 walk-forward backtest (`backtest_season.py` + `phase7_check.ipynb`).
 
 | Item | What it adds | Main payoff |
 |---|---|---|
-| **v2.0 Time-varying team ratings (first)** | Ratings that drift over time at an estimated rate (Track B option C), on top of v1.1 | Phase 7's remaining gap: react to teams that change without losing confidence in teams that don't. Target: beat rolling xG, and make blending with it stop helping |
+| **v2.0 Time-varying team ratings — DONE (live)** | Ratings and league levels that drift over time at an estimated rate, on top of v1.1 | Beat v1.1 clearly, tied/edged rolling xG, calibrated; see *v2.0* below |
 | **v2.1 Hierarchical xG layer** | Shooter, goalie, rink and season × shot-type effects on top of LightGBM xG | Finishing talent, a shrunk xG-based goalie rating, fixes for arena bias and redirect drift |
 | **v2.2 Lineup model** | Per-skater offensive/defensive effects (Bayesian RAPM), aggregated over tonight's lineup | Predictions that react to injuries, scratches and trades |
 | **v2.0c Phase 8 analysis B** | Sensitivity of one matchup's P(win) interval to each posterior uncertainty (correlated inputs: Shapley effects) | Explains what makes a prediction uncertain; points to which ratings need more data |
@@ -993,7 +997,79 @@ Phase 8 did analysis A (what makes games differ across the league). Analysis B a
 
 Left open when Phase 7 closed. None changes the model; each tells v2 where to aim. All use the Phase 7 backtest files (`output/backtests/*_scored.csv`) and `phase7_check.ipynb` unless noted.
 
-1. **Market comparison (most important).** The only test against the real benchmark: v1.1 ties rolling xG, but its gap to the betting market is unknown. Needs historical closing moneylines for 2024-25 and 2025-26 saved as `data/external/closing_lines.csv` (columns `date, home, away, home_ml, away_ml`; team abbreviations as in the database). Notebook section 10 then removes the margin (divide each implied probability by their sum, about 1.04–1.05) and scores the market like the models: log loss, Brier, calibration, paired difference vs v1.1. Realistic target: behind the market; each v2 model item is then measured by how much of that gap it closes. Also compare by subset to see where model and market disagree.
+1. **Market comparison (most important). Forward version RUNNING (started 2026-10-31):** `src/data/odds.py` + `src/pipelines/log_odds.py` (`py -m src.pipelines.log_odds [--markets h2h,totals,spreads]`) pull current NHL odds from The Odds API (free plan; key in `.env` as `ODDS_API_KEY`; 1 credit per moneyline snapshot) and append them to `output/forward/odds_<season>.csv` (one row per game × book × snapshot: moneylines, margin, no-vig P(home)). `score_forward` scores the market as the median no-vig P(home) across books from the **last snapshot taken before each game's start time** (exact: the API gives start times), next to the model: log loss, paired model-minus-market difference with a 90% range, and results on games where they differ by 5+ points. Tested with simulated API responses (matching, margin removal, the before-start rule, scoring). The historical (backtest) version below still needs past closing lines.
+   Historical version: The only test against the real benchmark: v1.1 ties rolling xG, but its gap to the betting market is unknown. Needs historical closing moneylines for 2024-25 and 2025-26 saved as `data/external/closing_lines.csv` (columns `date, home, away, home_ml, away_ml`; team abbreviations as in the database). Notebook section 10 then removes the margin (divide each implied probability by their sum, about 1.04–1.05) and scores the market like the models: log loss, Brier, calibration, paired difference vs v1.1. Realistic target: behind the market; each v2 model item is then measured by how much of that gap it closes. Also compare by subset to see where model and market disagree.
+2. **Results by subset.** Log loss, calibration and paired differences vs rolling xG for: the first month of the season (ratings carried over the summer), back-to-backs and rest days, games started by backup goalies, and games after trades. Shows which v2 item would help most (v2.0 for early season and trades, rest covariates for back-to-backs, v2.1 goalie effect for backups).
+3. **Cost of a wrong default starter.** The backtest used actual starters. Live predictions guess the starter (most starts in the last 10 games) unless `--home-goalie` / `--away-goalie` are given. Rerun the backtest predictions with the default starter instead of the actual one and compare log loss; the difference is what a wrong guess costs, and whether waiting for the confirmed starter is worth it.
+4. **Home-win share on held-out games.** In-sample the model gave 52.9–53.4% vs 54.2% actual. Check mean predicted vs actual home-win share per season in the backtest; if it is low out of sample too, look at the home-ice prior or season-varying home ice (v2.3).
+5. **Forward test on 2026-27 — RUNNING (started 2026-10-24).** Nothing was tuned on these games, so it is the cleanest check of the live setup (weekly refits, guessed starters, real-time data).
+   - `src/pipelines/predict_day.py`: `py -m src.pipelines.predict_day [--date D] [--days N] [--goalie TEAM=NAME|ID ...] [--list-goalies TEAM ...] [--replace]` predicts every regular-season game on the date(s) from the `schedule` table and appends to `output/forward/predictions_<season>.csv` (P(win) with 90% range, regulation/OT split, rates, fair odds, totals, puck lines, total-goals distribution, starters and whether they were given or guessed, historical home rate as a baseline, fit file, timestamp). It refuses games already loaded as played and dates inside the active fit's window. Run it in the morning: the schedule has dates, not puck-drop times.
+   - `src/pipelines/score_forward.py`: `py -m src.pipelines.score_forward [--season S]` scores, per game, the last prediction made on or before the game date: log loss, Brier, accuracy, calibration slope (90% ranges) vs the historical home rate and the Phase 7 backtest (0.6773); calibration table; by week; score outputs; and **how often the default starter was right** (with log loss on wrong-guess games), which also covers item 3 going forward. Writes `output/forward/scored_<season>.csv`.
+   - Expect a wide range for months: about ±0.03 in log loss after 300 games; differences of 0.005 need 1,000+ games.
+   - Test on the fake database (15 games): skips, `--replace` with given starters, leak guards and scoring all worked.
+   - **Game cards.** `predict_day` draws a pregame card for every game it logs, from the same numbers it logs (no second model run, so card and log always match); `--no-cards` turns it off, and a card that fails never stops the logging. Postgame cards: `py -m src.pipelines.make_cards postgame --pending` draws one for every logged game that is now loaded and scored (skips cards already drawn; `--redo` redraws), `--date D` for every loaded game on a date (logged or not), or give game ids. The postgame card shows the pregame P(win) the forward test scores (last prediction made on or before game day). Its "deserve to win" meter replays the game's shots 10,000 times, each scoring with its xG (`src/analysis/deserved.py`; tied replays go to the team with the larger xG share, the Phase 6 OT rule). `scripts/demo_cards.py` draws both cards on example data; `scripts/inspect_for_cards.py` prints the tables and signatures the cards use.
+
+### v2.0 — Time-Varying Team Ratings — DONE (live model since 2026-11-01)
+
+**Why:** Phase 7 showed v1.1 missed recent form (rolling xG tied it, and blending helped), and a recency half-life was the wrong fix (it forgets every team at the same rate and made predictions too cautious, slopes 1.5–1.6). Phase 8 showed team ratings drive 95% of P(win), so better ratings are the biggest lever.
+
+**Files:**
+- `src/models/stochastic/hierarchical_tv.py` — `time_grid`, `build_model_tv(gt, teams, step_days=7)` → `(model, grid)`, `sample_tv` (stores only the variables needed; `target_accept` 0.95), `add_current_ratings(idata, grid, end)`, `game_rates`, `add_paths`, `compact_paths`, `simulate_league_tv`
+- `fit_hierarchical.py` — `--model tv` (now the default), `--step-days`, `--draws`, `--tune`; 730-day window for tv
+- `backtest.py` / `backtest_season.py` — `model="tv"`, `--step-days`; labels `trackbtv_w730`, `trackbtv_w730_s2`
+- `late_game.py` (`mean_rates`), `montecarlo.py` (`calibrate_scale`), `game_model.py` (`load_track_b`) — for a v2.0 fit, past games use the ratings **as of their own date**
+- `notebooks/phase7_check.ipynb` — v2.0 labels and section 11, the v2.0 verdict
+
+**Model.** v1.1 (xG Gamma + tie-inflated Poisson goals, finishing effects, fixed goalie offsets, home ice, tie inflation), with:
+
+$$\mu^{xG}_{\text{off},t,k} = \mu^{xG}_{\text{off},t,k-1} + s_k\,\varepsilon_{t,k}, \qquad \textstyle\sum_t \varepsilon_{t,k} = 0, \qquad s_k = \begin{cases}\tau_{\text{off}}\sqrt{\text{gap}_k/7} & \text{in season}\\ \tau_{\text{off,summer}} & \text{across an off-season (gap > 45 days)}\end{cases}$$
+
+the same for defense, and both league levels ($\beta_0$: xG per game; $\delta_0$: goals per xG) as their own random walks. Steps are bins of `step_days` days that contain games. The zero-sum team steps send league-wide changes to $\beta_0$ / $\delta_0$ instead of moving all 32 ratings together. Priors (half-normal sd): team $\tau$ 0.02/week, team summer 0.10, league 0.01/week, league summer 0.05. Non-centered steps. For prediction, `add_current_ratings` steps every draw from the last step to the window end (an off-season step for a pre-season fit) and saves the result under the v1 names, so everything downstream is unchanged.
+
+**Synthetic recovery** (12 teams, 2 seasons): drifting teams + league → $\tau$ recovered (0.014–0.017 vs 0.015), 90% path coverage 91% / 89%; nothing drifting → $\tau$ shrinks to ~0.005 and ratings stay static; only the league drifting → drift goes to the league level, team $\tau$ near 0. No divergences.
+
+**Real fit** (730 days to 2026-04-17, 2,634 games): weekly team drift $\tau$ ≈ 0.012 (offense and defense) — over a season about ±0.06, as large as the spread between teams ($\sigma$ ≈ 0.05–0.06); summer steps 0.019 / 0.040 (wide: one off-season in the window); league xG level drifts 0.0135/week; conversion steady in season (0.005) but moves over the summer (0.043), matching Phase 3's season offsets. Home ice 0.072, $\rho$ 0.52 (same as v1.1). About 6 min per fit (1,000 draws); the lowest-ESS parameters are the summer steps (318–377); team paths ≥ 575. Live fits use `--draws 2000`.
+
+**Per-game rates (a needed fix):** late_game (OT factor) and score_state (simulator scale) compare real games with each game's expected rate. With time-varying ratings that rate must come from the ratings on the game's date: on the test data, per-game rates averaged 2.695 home goals vs 2.706 actual, while today's ratings applied to every past game gave 2.595.
+
+**Walk-forward backtest** (2,624 held-out games, same protocol as Phase 7):
+
+| Model | 2024-25 | 2025-26 | Combined | Calibration slope |
+|---|---|---|---|---|
+| **v2.0, weekly steps (adopted)** | **0.6652** | 0.6845 | **0.6749** | **0.98** [0.80, 1.15] |
+| v2.0, 2-day steps | — | — | ≈0.6750 | 0.98 [0.80, 1.14] |
+| v1.1 (1-yr) | 0.6670 | 0.6877 | 0.6773 | 0.99 |
+| v1.1, half-life 90 d | 0.6683 | **0.6841** | 0.6762 | 1.50 |
+| Rolling xG | 0.6669 | 0.6838 | 0.6754 | 0.83 |
+
+| Test | Result |
+|---|---|
+| v2.0 vs v1.1 | **−0.0025 [−0.0040, −0.0009]: clear win** (first change since v1.1 outside luck) |
+| v2.0 vs rolling xG | −0.0005 [−0.0038, +0.0027]: ahead, within luck (v1.1 trailed by 0.0019) |
+| Blend (v2.0 + rolling xG) minus v2.0 | −0.0011 [−0.0026, +0.0006]: no longer clearly helps (was −0.0023 to −0.0031 with v1.1) |
+| Weekly minus 2-day steps | −0.0001 [−0.0002, +0.0001]: identical → weekly kept |
+
+**What v2.0 found:**
+1. **Teams change within a season as much as they differ from each other,** and modelling that change at an estimated rate is what v1.1 was missing. It gains in both seasons: best of all in the steadier 2024-25, and in 2025-26 it matches the half-life versions while staying calibrated.
+2. **Step length doesn't matter** (weekly = 2-day). The remaining small blend gain (0.0011, within luck) is not about reacting a few days sooner.
+3. In 2025-26 alone the slope is 0.82 [0.52, 1.07] (slightly over-confident); rolling xG shows the same there (0.73), so it looks like a hard season rather than a v2.0 problem.
+
+**Open items:**
+- **ARI / UTA.** A 730-day window that starts in April 2024 includes Arizona's last games: ARI keeps a (drifting, data-free) rating in the zero-sum steps, and Utah starts from scratch. Fix: treat ARI → UTA as one franchise in the game table, then rerun v1.1 and v2.0 backtests so the comparison stays fair.
+- **Summer steps are loosely identified** with one off-season in the window; a 3-season window gives two (test in the backtest).
+- **Fit size:** about 50–70 MB per saved fit (paths stored as float32); delete old weekly fits now and then.
+- **League scoring level for totals:** now drifting; recheck the Phase 7 score outputs (totals) with v2.0.
+
+### v2.0c — Phase 8 Analysis B: What Drives One Matchup's Uncertainty
+
+Phase 8 did analysis A (what makes games differ across the league). Analysis B asks, for one game: which posterior uncertainties make its 90% P(win) interval wide (e.g. "COL–DAL's interval comes mostly from DAL's defense rating")? Inputs are that game's posterior draws (team ratings, home ice, $\rho$; goalie uncertainty once v2.1 makes it a draw instead of a fixed value). Those inputs are **correlated** (offense with defense, $\alpha_0$ with the ratings, $r = -0.81$), and Sobol' indices assume independent inputs, so the options are: decorrelate first (Rosenblatt / Nataf transform, or a PCE on whitened inputs; indices then belong to the transformed inputs), or Shapley effects, which share variance fairly among correlated inputs. Start with Shapley effects on the exact model (cheap); report next to the posterior-correlation matrix.
+
+### v2.0b — Phase 7 Follow-Ups (validation, not model changes)
+
+Left open when Phase 7 closed. None changes the model; each tells v2 where to aim. All use the Phase 7 backtest files (`output/backtests/*_scored.csv`) and `phase7_check.ipynb` unless noted.
+
+1. **Market comparison (most important). Forward version RUNNING (started 2026-10-31):** `src/data/odds.py` + `src/pipelines/log_odds.py` (`py -m src.pipelines.log_odds [--markets h2h,totals,spreads]`) pull current NHL odds from The Odds API (free plan; key in `.env` as `ODDS_API_KEY`; 1 credit per moneyline snapshot) and append them to `output/forward/odds_<season>.csv` (one row per game × book × snapshot: moneylines, margin, no-vig P(home)). `score_forward` scores the market as the median no-vig P(home) across books from the **last snapshot taken before each game's start time** (exact: the API gives start times), next to the model: log loss, paired model-minus-market difference with a 90% range, and results on games where they differ by 5+ points. Tested with simulated API responses (matching, margin removal, the before-start rule, scoring). The historical (backtest) version below still needs past closing lines.
+   Historical version: The only test against the real benchmark: v1.1 ties rolling xG, but its gap to the betting market is unknown. Needs historical closing moneylines for 2024-25 and 2025-26 saved as `data/external/closing_lines.csv` (columns `date, home, away, home_ml, away_ml`; team abbreviations as in the database). Notebook section 10 then removes the margin (divide each implied probability by their sum, about 1.04–1.05) and scores the market like the models: log loss, Brier, calibration, paired difference vs v1.1. Realistic target: behind the market; each v2 model item is then measured by how much of that gap it closes. Also compare by subset to see where model and market disagree.
 2. **Results by subset.** Log loss, calibration and paired differences vs rolling xG for: the first month of the season (ratings carried over the summer), back-to-backs and rest days, games started by backup goalies, and games after trades. Shows which v2 item would help most (v2.0 for early season and trades, rest covariates for back-to-backs, v2.1 goalie effect for backups).
 3. **Cost of a wrong default starter.** The backtest used actual starters. Live predictions guess the starter (most starts in the last 10 games) unless `--home-goalie` / `--away-goalie` are given. Rerun the backtest predictions with the default starter instead of the actual one and compare log loss; the difference is what a wrong guess costs, and whether waiting for the confirmed starter is worth it.
 4. **Home-win share on held-out games.** In-sample the model gave 52.9–53.4% vs 54.2% actual. Check mean predicted vs actual home-win share per season in the backtest; if it is low out of sample too, look at the home-ice prior or season-varying home ice (v2.3).
@@ -1345,6 +1421,14 @@ Decided during Phase 8:
 - **Truth model = exact game model,** evaluated directly (fast); Saltelli on the exact model checks the PCE indices.
 - **Inputs uniform and variance-matched** to their real spread (teams across the league, goalies across starters, league terms over their posterior); full-range inputs as a robustness check.
 - **Same PCE method as the soil project** (Legendre, total degree, least squares on LHS, LOO Q², hold-out test), degree 4 by default; no Morris screening step, since 10 inputs are cheap to keep.
+
+Decided during v2.0:
+
+- **Live model: Track B v2.0** (time-varying team ratings and league levels, 730-day window, weekly steps), default in `fit_hierarchical` (`DEFAULT_MODEL = "tv"` in `active_fit.py`); v1.1 stays available with `--model xg`.
+- **Weekly steps,** not 2-day: identical in the backtest, 3× cheaper.
+- **League levels drift too,** with zero-sum team steps, so league-wide change is not absorbed by the team ratings.
+- **Past games use the ratings of their date** in late_game and score_state.
+- **Live fits use 2,000 draws** (`--draws 2000`); backtests keep 1,000.
 
 ---
 
