@@ -13,6 +13,8 @@ Usage (from the project root):
     py -m src.pipelines.backtest_season --season 20252026 --model xg --window 730 --half-life 120
     py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730
     py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --step-days 2
+    py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest
+    py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest --home-drift
 
 Writes output/backtests/trackb_w<window>_<season>.csv (predictions, appended after every
 refit; stop any time and rerun to resume) and, when the season is complete,
@@ -59,6 +61,8 @@ def main():
                              "tv = Track B v2.0 (time-varying ratings)")
     parser.add_argument("--step-days", type=int, default=7,
                         help="v2.0 only: days per random-walk step (7 = weekly, 2 = about one per game)")
+    parser.add_argument("--rest", action="store_true", help="v2.0d: back-to-back effects")
+    parser.add_argument("--home-drift", action="store_true", help="v2.0d: home ice changes by season")
     parser.add_argument("--half-life", type=float, default=None,
                         help="v1.1 only: recency half-life in days (older games count less)")
     parser.add_argument("--seed", type=int, default=42)
@@ -68,7 +72,9 @@ def main():
     BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
     if args.half_life and args.model != "xg":
         raise SystemExit("--half-life is only supported with --model xg")
-    label = model_label(args.model, args.window, args.half_life, args.step_days)
+    if (args.rest or args.home_drift) and args.model != "tv":
+        raise SystemExit("--rest / --home-drift need --model tv")
+    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift)
     out = BACKTEST_DIR / f"{label}_{args.season}.csv"
     scored = BACKTEST_DIR / f"{label}_{args.season}_scored.csv"
     if args.restart:
@@ -80,7 +86,8 @@ def main():
     conn = get_connection()
     walk_forward(conn, args.season, window_days=args.window, refit_days=args.refit_days,
                  score_sims=args.score_sims, seed=args.seed, out_path=out,
-                 model=args.model, half_life=args.half_life, step_days=args.step_days)
+                 model=args.model, half_life=args.half_life, step_days=args.step_days,
+                 rest=args.rest, home_drift=args.home_drift)
 
     preds = add_results(conn, pd.read_csv(out, parse_dates=["game_date"]))
     conn.close()

@@ -88,6 +88,50 @@ def goalie_gamma(gg: pd.DataFrame, dates) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+# Relocated franchises: one team for the models (same roster and staff). Arizona moved to
+# Utah after 2023-24; without this, Utah starts from zero and ARI keeps a data-free rating.
+FRANCHISE = {"ARI": "UTA"}
+
+
+def _schedule_games(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Regular-season schedule (played and upcoming), team names franchise-mapped."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule)")}
+    where = "WHERE game_type = 2" if "game_type" in cols else ""
+    s = pd.read_sql(f"""SELECT game_id, game_date, home_team_abbrev AS home, away_team_abbrev AS away
+                        FROM schedule {where}""", conn)
+    s["game_date"] = pd.to_datetime(s["game_date"])
+    s[["home", "away"]] = s[["home", "away"]].replace(FRANCHISE)
+    return s
+
+
+def team_rest(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Days since each side's previous regular-season game (from the schedule).
+
+    Columns: game_id, rest_home, rest_away (NaN for a team's first game on record),
+             b2b_home, b2b_away (1 if that team also played the day before).
+    Known before puck drop, so usable for predictions.
+    """
+    s = _schedule_games(conn)
+    long = pd.concat([s[["game_id", "game_date", "home"]].rename(columns={"home": "team"}).assign(side="home"),
+                      s[["game_id", "game_date", "away"]].rename(columns={"away": "team"}).assign(side="away")])
+    long = long.sort_values(["team", "game_date", "game_id"])
+    long["rest"] = long.groupby("team")["game_date"].diff().dt.days
+    wide = long.pivot_table(index="game_id", columns="side", values="rest", aggfunc="first")
+    out = pd.DataFrame({"game_id": wide.index, "rest_home": wide.get("home"), "rest_away": wide.get("away")})
+    out["b2b_home"] = (out["rest_home"] == 1).astype(int)
+    out["b2b_away"] = (out["rest_away"] == 1).astype(int)
+    return out.reset_index(drop=True)
+
+
+def rest_on_date(conn: sqlite3.Connection, team: str, date) -> float:
+    """Days since `team`'s previous scheduled regular-season game before `date` (NaN if none)."""
+    s = _schedule_games(conn)
+    team = FRANCHISE.get(team, team)
+    d = pd.Timestamp(date).normalize()
+    prev = s[((s["home"] == team) | (s["away"] == team)) & (s["game_date"] < d)]["game_date"]
+    return float((d - prev.max()).days) if len(prev) else float("nan")
+
+
 def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.DataFrame, list[str]]:
     """One row per game in `seasons` for the Track B model.
 
@@ -95,7 +139,8 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
              home_goals, away_goals (periods 1-4), home_goals_reg, away_goals_reg
              (periods 1-3, what Track B fits), home_xg_reg, away_xg_reg (periods 1-3 xG),
              home_goalie, away_goalie,
-             gamma_home, gamma_away
+             gamma_home, gamma_away, rest_home, rest_away, b2b_home, b2b_away
+    Relocated franchises (FRANCHISE: ARI -> UTA) count as one team.
     Also returns `teams`: teams[i] is the abbreviation for index i.
     """
     # 1. Games: home rows of team_game_xg in these seasons, renamed
@@ -150,6 +195,14 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
 
     df[["gamma_home", "gamma_away"]] = df[["gamma_home", "gamma_away"]].fillna(0.0)
 
+    # 3b. Rest: days since each team's previous game, back-to-back flags (from the schedule)
+    df = df.merge(team_rest(conn), on="game_id", how="left")
+    df[["b2b_home", "b2b_away"]] = df[["b2b_home", "b2b_away"]].fillna(0).astype(int)
+
+    # 3c. Relocated franchises count as one team (after the goalie / starter merges,
+    #     which use the abbreviation of the season)
+    df[["home", "away"]] = df[["home", "away"]].replace(FRANCHISE)
+
     # 4. Team indices 0..n-1 from the sorted team list
     teams = sorted(set(df["home"]) | set(df["away"]))
 
@@ -163,7 +216,7 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
     cols = ["game_id", "game_date", "season", "home", "away", "home_idx", "away_idx",
             "home_goals", "away_goals", "home_goals_reg", "away_goals_reg",
             "home_xg_reg", "away_xg_reg", "home_goalie", "away_goalie",
-            "gamma_home", "gamma_away"]
+            "gamma_home", "gamma_away", "rest_home", "rest_away", "b2b_home", "b2b_away"]
     return df[cols], teams
 
 def select_window(gt: pd.DataFrame, start, end) -> tuple[pd.DataFrame, list[str]]:

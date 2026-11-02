@@ -47,6 +47,8 @@ from src.processing.goalie import goalie_game_xg
 from src.processing.late_game import load_params
 from src.models.active_fit import read_active, active_fit_path, check_params_match
 from src.models.game_model import load_track_b, default_starter, predict_matchup
+from src.models.stochastic.hierarchical_tv import rest_shift
+from src.processing.game_table import rest_on_date
 from src.models.stochastic.goalie import goalie_rating_as_of
 from src.models.stochastic.montecarlo import simulate_matchup_score_state
 from src.analysis.aggregation import fair_american_odds
@@ -133,9 +135,15 @@ def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims,
         r = ratings[ratings["goalie_id"] == gid] if gid is not None else ratings.iloc[0:0]
         gamma[side] = float(-np.log(r["theta_mean"].iloc[0])) if len(r) else 0.0
 
-    res = predict_matchup(draws, teams, late, home, away, gamma["home"], gamma["away"])
+    # Back-to-backs (v2.0d fits with rest terms; a zero shift otherwise), through the offsets
+    rest_h, rest_a = rest_on_date(conn, home, day), rest_on_date(conn, away, day)
+    b2b_h, b2b_a = int(rest_h == 1), int(rest_a == 1)
+    sh, sa = rest_shift(draws, [b2b_h], [b2b_a])
+    g_home_eff, g_away_eff = gamma["home"] - float(sa[0]), gamma["away"] - float(sh[0])
+
+    res = predict_matchup(draws, teams, late, home, away, g_home_eff, g_away_eff)
     s = res["summary"]
-    sims = simulate_matchup_score_state(draws, teams, late, ss, home, away, gamma["home"], gamma["away"],
+    sims = simulate_matchup_score_state(draws, teams, late, ss, home, away, g_home_eff, g_away_eff,
                                         n_sims=score_sims, seed=seed)
     fh, fa = sims["final_home"].to_numpy(), sims["final_away"].to_numpy()
     total, margin = fh + fa, fh - fa
@@ -145,6 +153,8 @@ def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims,
         "home_goalie": picks["home"], "away_goalie": picks["away"],
         "home_goalie_source": sources["home"], "away_goalie_source": sources["away"],
         "gamma_home": gamma["home"], "gamma_away": gamma["away"],
+        "rest_home": rest_h, "rest_away": rest_a, "b2b_home": b2b_h, "b2b_away": b2b_a,
+        "gamma_home_eff": g_home_eff, "gamma_away_eff": g_away_eff,
         "p_home": s["home_win"]["mean"], "p_home_lo": s["home_win"]["lo"], "p_home_hi": s["home_win"]["hi"],
         "p_reg_home": s["reg_home"]["mean"], "p_reg_away": s["reg_away"]["mean"], "p_tie_reg": s["tie_reg"]["mean"],
         "lam_home": res["rates"]["home"], "lam_away": res["rates"]["away"],
@@ -247,6 +257,7 @@ def main():
             rows.append(r)
             for_cards.append((r, res, sims))
             gs = "" if r["home_goalie_source"] == r["away_goalie_source"] == "default" else "  [starters given]"
+            gs += "".join(f"  [{t} back-to-back]" for t, b in ((g["home"], r["b2b_home"]), (g["away"], r["b2b_away"])) if b)
             print(f"{tag}  {g['home']} {r['p_home']:.1%} ({r['p_home_lo']:.0%}-{r['p_home_hi']:.0%})  "
                   f"fair {r['fair_home']} / {r['fair_away']}   total {r['exp_total']:.2f}, "
                   f"{g['home']} -1.5 {r['p_home_m1_5']:.1%}{gs}")

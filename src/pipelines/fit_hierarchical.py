@@ -9,7 +9,7 @@ Usage (from the project root):
     py -m src.pipelines.fit_hierarchical                      # v1.1, last 365 days of data (Phase 7 choice)
     py -m src.pipelines.fit_hierarchical --end 2026-12-01     # window ends the day before this date
     py -m src.pipelines.fit_hierarchical --model goals --window 730   # Track B v1, for comparison
-    py -m src.pipelines.fit_hierarchical --model tv                   # Track B v2.0, 730 days, weekly steps
+    py -m src.pipelines.fit_hierarchical --model tv                   # Track B v2.0 + back-to-backs, 730 days, weekly
     py -m src.pipelines.fit_hierarchical --model tv --step-days 2     # v2.0 with about one step per game
     py -m src.pipelines.fit_hierarchical --model tv --draws 2000      # longer run: cleaner R-hat / ESS
     py -m src.pipelines.fit_hierarchical --overwrite
@@ -216,6 +216,9 @@ def main():
                              "tv = Track B v2.0 (time-varying ratings)")
     parser.add_argument("--window", type=int, default=None,
                         help=f"training window in days (default {DEFAULT_WINDOW_DAYS}; {DEFAULT_TV_WINDOW} for tv)")
+    parser.add_argument("--rest", action=argparse.BooleanOptionalAction, default=None,
+                        help="back-to-back effects (default: on for --model tv, adopted in v2.0d; --no-rest turns them off)")
+    parser.add_argument("--home-drift", action="store_true", help="v2.0d: home ice changes by season")
     parser.add_argument("--draws", type=int, default=DRAWS,
                         help=f"posterior draws per chain (default {DRAWS}; 2000 gives cleaner R-hat / ESS, about 2x time)")
     parser.add_argument("--tune", type=int, default=TUNE, help=f"tuning steps per chain (default {TUNE})")
@@ -231,6 +234,10 @@ def main():
     args = parser.parse_args()
     if args.half_life and args.model != "xg":
         raise SystemExit("--half-life is only supported with --model xg")
+    if args.rest is None:
+        args.rest = args.model == "tv"                 # v2.0d: rest effects on by default for v2.0
+    if (args.rest or args.home_drift) and args.model != "tv":
+        raise SystemExit("--rest / --home-drift need --model tv")
     if args.window is None:
         args.window = DEFAULT_TV_WINDOW if args.model == "tv" else DEFAULT_WINDOW_DAYS
 
@@ -260,7 +267,7 @@ def main():
     seasons = sorted(gt["season"].astype(str).unique())
 
     # 2. Paths and overwrite protection
-    label = model_label(args.model, args.window, args.half_life, args.step_days)
+    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift)
     POSTERIOR_DIR.mkdir(parents=True, exist_ok=True)
     stem = POSTERIOR_DIR / f"{label}_{end:%Y%m%d}"
     nc_path = stem.with_suffix(".nc")
@@ -282,7 +289,8 @@ def main():
     # 3. Fit
     grid = None
     if args.model == "tv":
-        model, grid = htv.build_model_tv(gt, teams, step_days=args.step_days)
+        model, grid = htv.build_model_tv(gt, teams, step_days=args.step_days, rest=args.rest,
+                                         home_drift=args.home_drift)
         print(f"Time steps: {len(grid['gap_days'])} of {args.step_days} days "
               f"({int(grid['summer'].sum())} off-season)")
     elif args.model == "xg":
@@ -297,7 +305,9 @@ def main():
         idata = sample(model, seed=RANDOM_SEED, draws=args.draws, tune=args.tune)
 
     # 4. Diagnose
-    league_terms = LEAGUE_TERMS_BY_MODEL[args.model]
+    league_terms = LEAGUE_TERMS_BY_MODEL[args.model] + (
+        (htv.REST_VARS if args.rest else []) + (["tau_home_summer"] if args.home_drift else [])
+        if args.model == "tv" else [])
     diag = diagnostics(idata, league_terms, TEAM_TERMS_BY_MODEL[args.model])
 
     # 5. Save posterior (settings travel with the samples)
@@ -330,6 +340,7 @@ def main():
         "window_days": args.window,
         "half_life_days": args.half_life,
         "step_days": args.step_days if args.model == "tv" else None,
+        "rest": bool(args.rest), "home_drift": bool(args.home_drift),
         "window_start": str(start.date()),
         "window_end_excluded": str(end.date()),
         "seasons": seasons,
@@ -366,6 +377,7 @@ def main():
             "window_days": args.window,
             "half_life_days": args.half_life,
             "step_days": args.step_days if args.model == "tv" else None,
+            "rest": bool(args.rest), "home_drift": bool(args.home_drift),
             "start": str(start.date()),
             "end": str(end.date()),
             "seasons": seasons,

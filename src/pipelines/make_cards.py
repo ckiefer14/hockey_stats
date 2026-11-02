@@ -160,7 +160,9 @@ def make_pregame(game_id: int, n_sims: int = 100_000) -> Path:
     if row is None:
         raise SystemExit(f"Game {game_id} is not in the forward-test log. Run predict_day for its date first.")
     home, away = row["home"], row["away"]
-    g_home, g_away = float(row["gamma_home"]), float(row["gamma_away"])
+    # offsets as used for the logged prediction (incl. back-to-back shifts, v2.0d)
+    g_home = float(row["gamma_home_eff"]) if "gamma_home_eff" in row and pd.notna(row["gamma_home_eff"]) else float(row["gamma_home"])
+    g_away = float(row["gamma_away_eff"]) if "gamma_away_eff" in row and pd.notna(row["gamma_away_eff"]) else float(row["gamma_away"])
 
     draws, teams = load_track_b(POSTERIORS / row["fit_file"])
     late = _load_json(MODELS / "late_game.json")

@@ -30,7 +30,7 @@ py -m src.pipelines.make_cards postgame --pending
 
 # Weekly: grade the forward test, then refit
 py -m src.pipelines.score_forward
-py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 (default): ~12 min
+py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 + back-to-backs (default): ~12 min
 py -m src.processing.late_game
 py -m src.processing.score_state
 py -m src.pipelines.build_pce            # optional: refresh the Phase 8 indices
@@ -40,7 +40,7 @@ py -m src.pipelines.predict_day
 py -m src.pipelines.log_odds
 ```
 
-The fit is Track B v2.0 (time-varying ratings, 730-day window, weekly steps). `--draws 2000` keeps R-hat and ESS clean; `--model xg` fits v1.1 instead. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
+The fit is Track B v2.0 + back-to-back effects (time-varying ratings, 730-day window, weekly steps, rest on by default). `--draws 2000` keeps R-hat and ESS clean; `--no-rest` fits plain v2.0, `--model xg` fits v1.1. `predict_day` looks up each team's rest itself and tags games with `[TEAM back-to-back]`. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
 
 Refit in the **morning**, not at night: a fit made after a day's games includes them, so that day can no longer be predicted.
 

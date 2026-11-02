@@ -12,7 +12,7 @@ Usage (from the project root, after load_all.py has loaded the results):
 For each game, the prediction scored is the last one made on or before the game date
 (so a re-prediction with confirmed starters counts; one made after the game never does).
 Reports log loss, Brier, accuracy, calibration slope (with 90% bootstrap ranges) next to
-the historical home-win rate, the betting market (if log_odds.py has run) and the Phase 7 backtest, calibration by probability bin,
+the historical home-win rate, the betting market (if log_odds.py has run) and the backtest of the live model, calibration by probability bin,
 results by week, score outputs, and how often the default starting goalie was right.
 Writes output/forward/scored_<season>.csv.
 """
@@ -28,7 +28,7 @@ from src.validation.scoring import score_models, calibration_table, score_output
 from src.data.odds import consensus
 
 FORWARD_DIR = OUTPUT_DIR / "forward"
-BACKTEST_LOG_LOSS = 0.6773          # Phase 7: Track B v1.1, 1-yr window, 2,624 held-out games
+BACKTEST_LOG_LOSS = 0.6732          # v2.0d: Track B v2.0 + back-to-backs, 2,624 held-out games
 COIN_FLIP = float(np.log(2))
 
 
@@ -92,7 +92,7 @@ def main():
     print(table.drop(columns=["games", "intercept"]).round(4).to_string(index=False))
     ll = log_loss(df["p_home"], df["home_won"])
     se = np.std(-(df["home_won"] * np.log(df["p_home"]) + (1 - df["home_won"]) * np.log(1 - df["p_home"]))) / np.sqrt(len(df))
-    print(f"Live log loss {ll:.4f} ± {1.645 * se:.4f} (90%); Phase 7 backtest {BACKTEST_LOG_LOSS:.4f}; coin flip {COIN_FLIP:.4f}")
+    print(f"Live log loss {ll:.4f} ± {1.645 * se:.4f} (90%); backtest (v2.0 + rest) {BACKTEST_LOG_LOSS:.4f}; coin flip {COIN_FLIP:.4f}")
     if len(df) < 300:
         print(f"Only {len(df)} games: the range is wide. Differences of 0.005 need roughly 1,000+ games to show.")
 
