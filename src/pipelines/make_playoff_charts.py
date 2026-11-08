@@ -12,6 +12,7 @@ Usage (from the project root):
 Writes to output/playoffs/:
     playoff_board_<date>.png       one run: P(playoffs) per team by division, split by route in
     playoff_trend_<season>.png     every run this season: P(playoffs) lines per division
+    cup_odds_<date>.png            one run: every team's chance to get through each playoff round
 """
 
 import argparse
@@ -44,6 +45,9 @@ def make_charts(date: str | None = None) -> list[Path]:
     day = run.stem[-10:]
     note = f"fit {tab['fit_file'].iloc[0]}" if "fit_file" in tab else ""
     out = [_save(plot_playoff_board(tab, day, note=note), PLAYOFF_DIR / f"playoff_board_{day}.png")]
+    if "p_cup" in tab and tab["p_cup"].notna().all():
+        from src.viz.playoff_chart import plot_cup_odds
+        out.append(_save(plot_cup_odds(tab, day, note=note), PLAYOFF_DIR / f"cup_odds_{day}.png"))
 
     hist_files = sorted(PLAYOFF_DIR.glob("playoff_odds_history_*.csv"))
     hist_files = [f for f in hist_files if day in set(pd.read_csv(f, usecols=["date"])["date"].astype(str))]

@@ -233,3 +233,66 @@ def plot_playoff_trend(hist: pd.DataFrame, season: str = "", note: str = ""):
         foot += f"   ·   {note}"
     fig.text(0.04, 0.02, foot, fontsize=8, color=cs.MUTED, va="bottom")
     return fig
+
+
+# --------------------------------------------------------------------------
+# Stanley Cup: round by round
+# --------------------------------------------------------------------------
+
+CUP_COLS = [("p_playoffs", "Make playoffs"), ("p_round2", "Win round 1"), ("p_conf_final", "Win round 2"),
+            ("p_final", "Win conference"), ("p_cup", "Win Cup")]
+
+
+def plot_cup_odds(tab: pd.DataFrame, date: str | None = None, note: str = "", top: int | None = None):
+    """Every team (or the top `top`) by P(win Cup): chance to get through each round, as shaded cells
+    (one blue scale: darker = likelier)."""
+    date = date or str(tab["date"].iloc[0])
+    t = tab.sort_values(["p_cup", "p_final", "p_playoffs"], ascending=False).reset_index(drop=True)
+    if top:
+        t = t.head(top)
+    n = len(t)
+    row_in = 0.34
+    H = 2.4 + n * row_in
+    fig = cs.new_figure(12, H)
+    Y = lambda inches: 1 - inches / H
+    fig.text(0.04, Y(0.35), f"Stanley Cup odds · {date}", fontsize=22, fontweight="bold", va="top")
+    sims = int(tab["sims"].iloc[0]) if "sims" in tab else None
+    fig.text(0.04, Y(0.85), (f"{sims:,} simulated seasons, each playoff bracket played out: " if sims else "")
+             + "best of 7 (2-2-1-1-1), sudden-death overtime, ratings drifting through the rounds",
+             fontsize=9.5, color=cs.INK_2, va="top")
+    top_in = 1.25
+    cs.card_background(fig, [(0.025, Y(H - 0.45), 0.975, Y(top_in))])
+    x_cols = np.linspace(0.36, 0.90, len(CUP_COLS))
+    cw = (x_cols[1] - x_cols[0]) * 0.92
+    hdr = Y(top_in + 0.3)
+    fig.text(0.045, hdr, "#", fontsize=9, color=cs.MUTED, fontweight="bold", va="center")
+    fig.text(0.085, hdr, "Team", fontsize=9, color=cs.MUTED, fontweight="bold", va="center")
+    for x, (_, lab) in zip(x_cols, CUP_COLS):
+        fig.text(x, hdr, lab, fontsize=9, color=cs.MUTED, fontweight="bold", va="center", ha="center")
+    rows_top = top_in + 0.55
+    for i, r in t.iterrows():
+        yy = Y(rows_top + (i + 0.5) * row_in)
+        c = _team_colors_one(r["team"])
+        fig.text(0.045, yy, str(i + 1), fontsize=11, fontweight="bold", va="center")
+        fig.text(0.085, yy, r["team"], fontsize=11.5, fontweight="bold", color=cs.ink_for(c), va="center")
+        fig.text(0.145, yy, f"{r['conference']} · {r['division']}".replace("ern ·", " ·"), fontsize=8.5,
+                 color=cs.INK_2, va="center")
+        for x, (col, _) in zip(x_cols, CUP_COLS):
+            v = float(r[col])
+            fill = cs.SEQ_BLUE(min(v, 1.0) ** 0.6 * 0.95)
+            fig.patches.append(FancyBboxPatch((x - cw / 2, yy - row_in / H * 0.40), cw, row_in / H * 0.80,
+                                              boxstyle="round,pad=0,rounding_size=0.004", transform=fig.transFigure,
+                                              facecolor=fill, edgecolor="none", zorder=-4))
+            fig.text(x, yy, _pct(v), fontsize=9.5, fontweight="bold" if col == "p_cup" else "normal",
+                     color=cs.text_on(fill), va="center", ha="center")
+    foot = "Bracket: better division winner plays the 2nd wild card; home ice to the higher seed in rounds 1-2, " \
+           "better record after."
+    if note:
+        foot += f"   ·   {note}"
+    fig.text(0.04, Y(H - 0.2), foot, fontsize=8, color=cs.MUTED, va="bottom")
+    return fig
+
+
+def _team_colors_one(team: str) -> str:
+    opts = cs._team_colors(team) or [cs.ROAD_NEUTRAL]
+    return sorted(opts, key=lambda c: 1 if cs.oklab(c)[0] > 0.84 else 0)[0]

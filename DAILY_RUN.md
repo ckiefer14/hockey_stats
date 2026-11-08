@@ -54,8 +54,8 @@ py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 + back-to-backs + lin
 py -m src.processing.late_game
 py -m src.processing.score_state
 py -m src.pipelines.build_pce            # optional: refresh the Phase 8 indices
-py -m src.pipelines.playoff_odds         # playoff odds from the new fit (~1-2 min) + charts:
-                                         #   output/playoffs/playoff_board_<date>.png, playoff_trend_<season>.png
+py -m src.pipelines.playoff_odds         # playoff + Stanley Cup odds from the new fit (~1-2 min) + charts:
+                                         #   output/playoffs/playoff_board_<date>.png, cup_odds_<date>.png, playoff_trend_<season>.png
 py -m src.pipelines.make_team_card --all  # team cards + rankings card (~1 min): output/teams/<date>/<TEAM>.png, rankings.png
 py -m src.pipelines.fit_xg_layer --final  # shooter finishing (and goalie / rink) effects for the player cards (a few min)
 py -m src.pipelines.make_player_card --all   # every rated skater this season (~3-6 min); or names / ids / --team BOS

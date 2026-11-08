@@ -5,7 +5,8 @@ Home: src/viz/rankings_card.py
 Built by src/pipelines/make_team_card.py (``--rankings``, also with ``--all``) from
 league_table(): position 1..N by the posterior mean net rating (offense + defense, starting
 goalie excluded), the 90% range of the rank across posterior draws, offense / defense
-positions, and the latest playoff odds. Same numbers as the rank tiles on the team cards.
+positions, the latest playoff odds and Stanley Cup odds (when the playoff_odds run has them), and
+projected points. Same numbers as the rank tiles on the team cards.
 """
 
 from __future__ import annotations
@@ -37,13 +38,17 @@ def plot_rankings_card(table: pd.DataFrame, date: str, records: dict | None = No
     cs.card_background(fig, [(0.025, Y(bot_in), 0.975, Y(top_in))])
     hdr = Y(top_in + 0.22)
     ax_x0, ax_x1 = 0.30, 0.60
-    cols = {"range": 0.665, "off": 0.74, "def": 0.81, "po": 0.88, "pts": 0.94}
+    has_cup = playoffs is not None and "p_cup" in playoffs and playoffs["p_cup"].notna().all()
+    cols = {"range": 0.655, "off": 0.725, "def": 0.785, "po": 0.845, "cup": 0.90, "pts": 0.95} if has_cup else \
+        {"range": 0.665, "off": 0.74, "def": 0.81, "po": 0.88, "pts": 0.94}
     fig.text(0.045, hdr, "#", fontsize=9, color=cs.MUTED, fontweight="bold", va="center")
     fig.text(0.09, hdr, "Team", fontsize=9, color=cs.MUTED, fontweight="bold", va="center")
     fig.text((ax_x0 + ax_x1) / 2, hdr, "Net rating vs average team (90% range)", fontsize=9, color=cs.MUTED,
              fontweight="bold", va="center", ha="center")
     for k, lab in (("range", "Rank range"), ("off", "Offense"), ("def", "Defense"),
-                   ("po", "Playoffs"), ("pts", "Proj. pts")):
+                   ("po", "Playoffs"), ("cup", "Cup"), ("pts", "Pts" if has_cup else "Proj. pts")):
+        if k not in cols:
+            continue
         fig.text(cols[k], hdr, lab, fontsize=9, color=cs.MUTED, fontweight="bold", va="center", ha="center")
 
     rows_top = top_in + 0.62
@@ -91,6 +96,10 @@ def plot_rankings_card(table: pd.DataFrame, date: str, records: dict | None = No
             fig.text(cols["po"], yy, ptxt, fontsize=9.5, fontweight="bold", color=cs.INK, va="center", ha="center")
             fig.text(cols["pts"], yy, f"{playoffs.loc[t, 'points_mean']:.0f}", fontsize=9.5, color=cs.INK_2,
                      va="center", ha="center")
+            if has_cup:
+                pc = float(playoffs.loc[t, "p_cup"])
+                fig.text(cols["cup"], yy, "<0.1%" if pc < 0.001 else f"{100 * pc:.1f}%", fontsize=9.5,
+                         color=cs.INK, va="center", ha="center")
 
     foot = model_label or "Track B"
     if odds_date:

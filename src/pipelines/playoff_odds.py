@@ -18,7 +18,8 @@ Usage (from the project root, after load_all; any morning, e.g. weekly after the
 3. 10,000 seasons, each with one posterior draw for all its games plus weekly rating drift.
 Prints each division with points now, projected points (mean, 90% range) and the chances to
 make the playoffs, win the division, take a wild card, finish first in the conference, and
-win the Presidents' Trophy. Saves output/playoffs/playoff_odds_<date>.csv and appends to
+win the Presidents' Trophy; then the Stanley Cup odds: each simulated season's playoff bracket
+is played out (season_sim.simulate_playoffs), giving the chance to reach each round and win. Saves output/playoffs/playoff_odds_<date>.csv and appends to
 playoff_odds_history_<season>.csv (one row per team per run, for charts over the season), then
 draws playoff_board_<date>.png and playoff_trend_<season>.png (make_playoff_charts.py; --no-charts).
 """
@@ -151,6 +152,11 @@ def main():
     print(f"Simulating {args.sims:,} seasons{' (no rating drift)' if args.no_drift else ''}...", flush=True)
     res = ss.simulate_season(draws, teams, late, sched, standings, info.reset_index(drop=True), gamma, day,
                              n_sims=args.sims, seed=args.seed, drift=not args.no_drift)
+    try:                                                      # Stanley Cup bracket on top of each season
+        ss.simulate_playoffs(res, info.reset_index(drop=True), gamma, late, np.random.default_rng(args.seed + 1),
+                             drift=not args.no_drift)
+    except ValueError as e:
+        print(f"Stanley Cup odds skipped: {e}")
     tab = ss.summarize(res, info.reset_index(drop=True), standings)
     spots = sum(min(3, n) for n in info.groupby("division").size()) + sum(
         min(2, max(0, len(g) - sum(min(3, n) for n in g.groupby("division").size()))) for _, g in info.groupby("conference"))
@@ -168,6 +174,16 @@ def main():
                                                   "p_conf_first": "1st conf", "p_presidents": "Presidents'"})
               .to_string(index=False, formatters={c: "{:.1%}".format for c in
                                                   ["playoffs", "division", "wild card", "1st conf", "Presidents'"]}))
+
+    if "p_cup" in tab:
+        cup = tab.sort_values("p_cup", ascending=False).head(12)
+        print("\nStanley Cup (best of 7, 2-2-1-1-1, sudden-death OT; ratings keep drifting through the rounds):")
+        print(cup[["team", "p_playoffs", "p_round2", "p_conf_final", "p_final", "p_cup"]]
+              .rename(columns={"p_playoffs": "playoffs", "p_round2": "2nd round", "p_conf_final": "conf final",
+                               "p_final": "Cup Final", "p_cup": "win Cup"})
+              .to_string(index=False, formatters={c: "{:.1%}".format for c in
+                                                  ["playoffs", "2nd round", "conf final", "Cup Final", "win Cup"]}))
+        print(f"  (top 12 of {len(tab)}; every team's odds are in the saved CSV)")
 
     PLAYOFF_DIR.mkdir(parents=True, exist_ok=True)
     tab.insert(0, "date", str(day))

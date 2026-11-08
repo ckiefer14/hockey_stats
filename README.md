@@ -1436,6 +1436,24 @@ setup in DAILY_RUN.md. `consensus()` now returns `minutes_before` (start minus s
 (snapshots 30 minutes or less before the start). Historical closing lines (past seasons) would need
 the paid historical odds endpoint, so the comparison builds up from now on.
 
+### v2.7 — Stanley Cup Odds — DONE (2026-11-08)
+`season_sim.simulate_playoffs` plays each simulated season's bracket (called by `playoff_odds`).
+- Bracket (NHL since 2014): the better division winner plays the 2nd wild card, the other the 1st;
+  2nd vs 3rd in each division; round 2 inside each half; conference final; Cup Final.
+- Home ice: higher seed in rounds 1-2 (division winner, 2nd, 3rd, wild card), better record after.
+- Games: best of 7, 2-2-1-1-1; exact series probability by enumeration (checked against brute
+  force). A game tied after regulation goes to sudden-death overtime, won by the team that scores
+  first (its share of the combined scoring rate); no shootouts.
+- Ratings: each team's end-of-season rating in that simulated season (same posterior draw plus
+  the season's drift), drifting 2 weeks per round. Goalie offsets: the regular-season starter mix.
+- Checks on a 32-team test league (4,000 seasons): 16 / 8 / 4 / 2 / 1 teams per round in every
+  season, 2nd and 3rd of a division never both advance, P(Cup) sums to 1; the strongest teams come
+  out at 12-14%, about where real favourites sit. A league that cannot form the bracket is skipped.
+Output: columns p_round2, p_conf_final, p_final, p_cup in playoff_odds_<date>.csv (and history),
+`cup_odds_<date>.png` (make_playoff_charts), a Cup column on the rankings card, Cup odds on the team
+card's playoff tile. Not modelled: playoff-specific home ice or scoring (regular-season values used),
+re-seeding (the NHL does not re-seed), injuries during the playoffs.
+
 ### v2.3 — Other Candidate Improvements
 
 Smaller items already listed under *Open Questions*, gathered here so v2 has one list:

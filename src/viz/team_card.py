@@ -105,7 +105,11 @@ def _tiles(fig, d: TeamCardData, c: str, rect):
         last = ph.sort_values("date").iloc[-1]
         p = float(last["p_playoffs"])
         ptxt = ">99.9%" if p > 0.999 else "<0.1%" if p < 0.001 else cs.pct(p)
-        tiles.append(("Make playoffs", ptxt, f"odds of {pd.Timestamp(last['date']).date()}"))
+        sub = f"odds of {pd.Timestamp(last['date']).date()}"
+        if "p_cup" in last and pd.notna(last["p_cup"]):
+            pc = float(last["p_cup"])
+            sub = f"win Cup {'<0.1%' if pc < 0.001 else f'{100 * pc:.1f}%'} · {sub}"
+        tiles.append(("Make playoffs", ptxt, sub))
         tiles.append(("Projected points", f"{last['points_mean']:.0f}",
                       f"90% range {last['points_lo']:.0f}–{last['points_hi']:.0f}"))
     if not tiles:
