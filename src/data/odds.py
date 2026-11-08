@@ -22,6 +22,7 @@ import requests
 from config.settings import PROJECT_ROOT
 
 API_URL = "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds/"
+EVENTS_URL = "https://api.the-odds-api.com/v4/sports/icehockey_nhl/events"     # start times; costs no credits
 
 # The Odds API uses full team names; aliases cover renames and spellings.
 TEAM_ABBR = {
@@ -67,6 +68,15 @@ def fetch_odds(markets: str = "h2h", regions: str = "us", bookmakers: str | None
     r.raise_for_status()
     quota = {k: r.headers.get(f"x-requests-{k}") for k in ("remaining", "used", "last")}
     return r.json(), quota
+
+
+def fetch_events() -> list:
+    """Upcoming NHL events (id, home_team, away_team, commence_time). Free: no credits used."""
+    r = requests.get(EVENTS_URL, params={"apiKey": api_key()}, timeout=30)
+    if r.status_code == 401:
+        raise SystemExit("The Odds API rejected the key (401). Check ODDS_API_KEY in .env.")
+    r.raise_for_status()
+    return r.json()
 
 
 def american_to_prob(ml) -> float:
@@ -130,13 +140,15 @@ def consensus(odds: pd.DataFrame, before_start: bool = True) -> pd.DataFrame:
     in the last snapshot taken before the game started (closest to the closing line)."""
     o = odds.dropna(subset=["p_home_novig"]).copy()
     if o.empty:
-        return pd.DataFrame(columns=["game_id", "p_market", "books", "market_snapshot", "overround"])
+        return pd.DataFrame(columns=["game_id", "p_market", "books", "market_snapshot", "overround", "minutes_before"])
     o["snap"] = pd.to_datetime(o["snapshot_at"], utc=True)
     o["start"] = pd.to_datetime(o["commence_time"], utc=True)
     if before_start:
         o = o[o["snap"] < o["start"]]
     last = o.groupby("game_id")["snap"].transform("max")
     o = o[o["snap"] == last]
+    o["minutes_before"] = (o["start"] - o["snap"]).dt.total_seconds() / 60
     out = o.groupby("game_id").agg(p_market=("p_home_novig", "median"), books=("book", "nunique"),
-                                   market_snapshot=("snapshot_at", "max"), overround=("overround", "median"))
+                                   market_snapshot=("snapshot_at", "max"), overround=("overround", "median"),
+                                   minutes_before=("minutes_before", "first"))
     return out.reset_index()

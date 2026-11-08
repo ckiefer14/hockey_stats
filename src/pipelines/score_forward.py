@@ -108,6 +108,14 @@ def main():
             t = score_models(dm, {"Track B (live)": "p_home", "Market": "p_market", "Home rate": "p_home_rate"},
                              reference="Market", n_boot=1000)
             print(t.drop(columns=["games", "intercept"]).round(4).to_string(index=False))
+            mb = dm["minutes_before"]
+            close = dm[mb <= 30]
+            print(f"Line taken a median of {mb.median():.0f} min before puck drop; {len(close):,} games have a "
+                  f"closing snapshot (30 min or less: log_closing.py)")
+            if 0 < len(close) < len(dm):
+                dc = paired_difference(close, "p_home", "p_market")
+                print(f"  closing lines only: model minus market {dc['difference']:+.4f} "
+                      f"(90% {dc['lo']:+.4f} to {dc['hi']:+.4f})")
             d = paired_difference(dm, "p_home", "p_market")
             print(f"Model minus market log loss {d['difference']:+.4f} (90% {d['lo']:+.4f} to {d['hi']:+.4f}); "
                   f"negative = model better. Mean |model - market| {100 * (dm['p_home'] - dm['p_market']).abs().mean():.1f} pts")

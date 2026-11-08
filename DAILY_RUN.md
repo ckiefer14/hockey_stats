@@ -33,7 +33,7 @@ line combinations (projected lineups from morning skates) and team beat reporter
 If the NHL has already posted the dressed lineup (the morning roster is about 23 per team; the dressed lineup is 18
 skaters), it is used as is and the line says `posted`. If a feed is down the line says so and the rest still works.
 
-- Optional: run `py -m src.pipelines.log_odds` again shortly before the first game. Scoring uses each game's **last line taken before it started**, so a later snapshot is closer to the closing line (1 credit per run; the free plan has 500 a month).
+- **Closing lines (every game day):** `py -m src.pipelines.log_closing` waits and takes one snapshot about 10 minutes before each group of start times (3-5 a night, 1 credit each), so every game gets a line from just before puck drop. Start it any time before the first game and leave the window open, or let Task Scheduler start it (see "Closing lines" below). `--dry-run` shows the plan without using credits. Scoring uses each game's **last line taken before it started**.
 
 - `score_xg` must run before the postgame cards (they need each shot's xG).
 - `predict_day` goes last so it uses the newest goalie history.
@@ -79,6 +79,26 @@ Refit in the **morning**, not at night: a fit made after a day's games includes 
 3. `py -m src.pipelines.log_odds` prints each game's market P(home win) (median over books, margin removed) next to the model's, and appends to `output/forward/odds_<season>.csv`. `--markets h2h,totals,spreads` also logs totals and puck lines (3 credits).
 
 `score_forward` then adds a **model vs market** section: log loss for both on the same games, the paired difference with a 90% range, and how each did on games where they disagree by 5+ points.
+
+## Closing lines (one-time setup)
+
+`log_closing` needs the computer awake at the snapshot times (it sleeps between them; if the computer was asleep and a game
+already started, it says "missed" and moves on). To start it automatically every day at 11:00 am, run once in PowerShell
+(one line; change the path if your project lives elsewhere):
+
+```powershell
+schtasks /Create /TN "NHL closing lines" /SC DAILY /ST 11:00 /TR "cmd /c cd /d C:\Users\ckief\personal_projects\hockey_stats_code && py -m src.pipelines.log_closing >> output\forward\log_closing.log 2>&1"
+```
+
+- Check it: Task Scheduler → Task Scheduler Library → "NHL closing lines" → Run; then read `output\forward\log_closing.log`.
+- Remove it: `schtasks /Delete /TN "NHL closing lines" /F`.
+- Keep the laptop plugged in with sleep off in the evenings (Settings → System → Power) or the late snapshots are missed.
+- Credits: morning `log_odds` + about 4 closing snapshots a day is about 150 a month (free plan: 500). It stops itself
+  below 20 credits left.
+
+`score_forward` reports how long before puck drop the lines were taken and, once some games have them, the model vs
+market comparison on closing lines only (30 minutes or less before the start). Closing lines are the sharpest version of
+the market: the honest benchmark.
 
 ## Re-predicting a game (`--replace`)
 

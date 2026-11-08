@@ -1424,6 +1424,18 @@ Tiles: starts and share of the team's starts, save % (shots on goal, periods 1-4
 above expected this season, goals per game vs an average goalie at the window's average
 workload. Trend: Phase 3 rating weekly (in-season weeks) against the middle 80% of regulars.
 
+### v2.6 — Closing Lines — DONE (2026-11-08)
+For the market comparison, the benchmark is the closing line (the last price before puck drop),
+the sharpest the market gets. `src/pipelines/log_closing.py` gets the day's start times from
+The Odds API events list (free), groups games starting within 20 minutes, sleeps, and takes one
+moneyline snapshot 10 minutes before each group (1 credit each, 3-5 a night), appending to
+`output/forward/odds_<season>.csv` like `log_odds`. It re-reads start times before each snapshot,
+reports games missed while the computer slept, and stops below 20 credits. Windows Task Scheduler
+setup in DAILY_RUN.md. `consensus()` now returns `minutes_before` (start minus snapshot);
+`score_forward` prints the median and the model vs market difference on closing lines only
+(snapshots 30 minutes or less before the start). Historical closing lines (past seasons) would need
+the paid historical odds endpoint, so the comparison builds up from now on.
+
 ### v2.3 — Other Candidate Improvements
 
 Smaller items already listed under *Open Questions*, gathered here so v2 has one list:
