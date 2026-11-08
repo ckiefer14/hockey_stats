@@ -11,7 +11,7 @@ build/
 .ipynb_checkpoints/
 
 # Data and generated output (rebuild with the pipelines; see README)
-data/
+/data/
 *.db
 output/
 *.pkl

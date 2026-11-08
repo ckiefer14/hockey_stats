@@ -27,7 +27,7 @@ import pandas as pd
 from config.settings import OUTPUT_DIR
 from src.data.db import get_connection
 from src.models.deterministic import rapm
-from models.stochastic import lineup_rapm as lr
+from src.models.stochastic import lineup_rapm as lr
 from src.pipelines.fit_rapm import names
 
 MODEL_DIR = OUTPUT_DIR / "models"
