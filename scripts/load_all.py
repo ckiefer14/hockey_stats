@@ -8,6 +8,11 @@ run get picked up.
 Usage (from the project root):
     py .\scripts\load_all.py                    # seasons from config/settings.py
     py .\scripts\load_all.py --all-schedules    # refetch schedules even for complete seasons
+    py .\scripts\load_all.py --shifts-only      # only retry games that have no shift chart yet
+
+Shift charts: a game whose shift request fails or comes back empty is retried on later
+runs (shift_fetch_log tracks the tries). Failures are retried every run; an empty answer
+(the NHL had not posted the chart) at most once every EMPTY_RETRY_DAYS days.
 
 Rate limits: the NHL API answers "429 Too Many Requests" when called too fast.
 Every request here waits SLEEP_BETWEEN_CALLS seconds first, and a 429 is retried
@@ -38,6 +43,7 @@ FAILURE_LOG = "data_load_failures.log"
 SLEEP_BETWEEN_CALLS = 1.0       # seconds before every API request
 MAX_TRIES = 6                   # attempts per request when rate-limited
 BACKOFF_START = 10.0            # first wait after a 429 if the API gives no Retry-After
+EMPTY_RETRY_DAYS = 1            # an empty shift chart is asked for again after this many days (an empty answer can be a fluke)
 
 
 def log_failure(msg: str) -> None:
@@ -53,6 +59,14 @@ def call(fn, *args, **kwargs):
         time.sleep(SLEEP_BETWEEN_CALLS)
         try:
             return fn(*args, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:   # stalled or dropped: try again
+            if attempt == MAX_TRIES:
+                raise
+            print(f"    no answer from the API ({type(e).__name__}); retrying in {wait:.0f} s "
+                  f"(attempt {attempt}/{MAX_TRIES})")
+            time.sleep(wait)
+            wait *= 2
+            continue
         except requests.HTTPError as e:
             resp = e.response
             if resp is None or resp.status_code != 429 or attempt == MAX_TRIES:
@@ -62,6 +76,65 @@ def call(fn, *args, **kwargs):
             print(f"    rate-limited (429); waiting {pause:.0f} s (attempt {attempt}/{MAX_TRIES})")
             time.sleep(pause)
             wait *= 2
+
+
+def fetch_and_store_shifts(conn, game_id: int) -> int:
+    """Fetch one game's shift chart, store it, record the try. Returns rows stored (0 = empty);
+    raises on failure (also recorded, so the game is retried next run)."""
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        shifts = call(fetch_shifts, game_id)
+    except Exception as e:
+        conn.execute("INSERT OR REPLACE INTO shift_fetch_log VALUES (?, ?, ?, ?)", (game_id, now, -1, str(e)[:200]))
+        conn.commit()
+        raise
+    store_shifts(conn, shifts)
+    conn.execute("INSERT OR REPLACE INTO shift_fetch_log VALUES (?, ?, ?, ?)", (game_id, now, len(shifts), None))
+    conn.commit()
+    return len(shifts)
+
+
+def games_missing_shifts(conn) -> list[int]:
+    """Loaded regular-season games with no shift rows that are due a retry: never tried,
+    failed last time, or empty and last tried EMPTY_RETRY_DAYS+ days ago."""
+    rows = conn.execute(f"""
+        SELECT g.id FROM games g
+        LEFT JOIN shift_fetch_log l ON l.game_id = g.id
+        WHERE g.game_type = 2
+          AND NOT EXISTS (SELECT 1 FROM shifts s WHERE s.game_id = g.id AND s.duration IS NOT NULL)
+          AND (l.game_id IS NULL OR l.n_rows < 0
+               OR julianday('now') - julianday(l.tried_at) >= {EMPTY_RETRY_DAYS})
+        ORDER BY g.id
+    """).fetchall()
+    return [r[0] for r in rows]
+
+
+def backfill_shifts(conn) -> None:
+    """Retry shift charts for loaded games that have none (see games_missing_shifts)."""
+    print("Shift charts: finding loaded games without one...", flush=True)
+    ids = games_missing_shifts(conn)
+    if not ids:
+        print("Shift charts: every loaded game has one (or was asked recently).")
+        return
+    print(f"Shift charts: retrying {len(ids):,} loaded games without one "
+          f"(about {len(ids) * 1.5 / 60:.0f} min; a progress line every 10 games)...", flush=True)
+    got = empty = failed = 0
+    t0 = time.time()
+    for i, gid in enumerate(ids):
+        try:
+            n = fetch_and_store_shifts(conn, gid)
+            got += n > 0
+            empty += n == 0
+        except Exception as e:
+            failed += 1
+            log_failure(f"Shift backfill: game {gid} FAILED: {e}")
+        if (i + 1) % 10 == 0 or i + 1 == len(ids):
+            el = time.time() - t0
+            left = el / (i + 1) * (len(ids) - i - 1)
+            print(f"  [{i + 1}/{len(ids)}] filled {got}, still empty {empty}, failed {failed}  "
+                  f"({el / 60:.1f} min so far, about {left / 60:.0f} min left)", flush=True)
+    print(f"Shift charts: filled {got:,}, still empty {empty:,} (asked again in {EMPTY_RETRY_DAYS} days), "
+          f"failed {failed:,} (retried next run)")
 
 
 def complete_seasons(conn) -> set[str]:
@@ -77,10 +150,23 @@ def main():
     parser = argparse.ArgumentParser(description="Load NHL data into the database.")
     parser.add_argument("--all-schedules", action="store_true",
                         help="refetch schedules even for seasons that are already complete")
+    parser.add_argument("--shifts-only", action="store_true",
+                        help="only retry shift charts for loaded games that have none")
     args = parser.parse_args()
 
+    print("Opening the database...", flush=True)
     conn = get_connection()
     create_tables(conn)
+    conn.execute("""CREATE TABLE IF NOT EXISTS shift_fetch_log (
+                        game_id INTEGER PRIMARY KEY, tried_at TEXT, n_rows INTEGER, error TEXT)""")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_shifts_game'").fetchone():
+        print("Indexing the shifts table by game (one time, under a minute)...", flush=True)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shifts_game ON shifts(game_id)")
+    conn.commit()
+    if args.shifts_only:
+        backfill_shifts(conn)
+        conn.close()
+        return
 
     # 1. Teams
     teams = call(fetch_teams)
@@ -142,11 +228,10 @@ def main():
             store_game_events(conn, events)
 
             try:
-                shifts = call(fetch_shifts, game_id)
-                store_shifts(conn, shifts)
-                shift_count = len(shifts)
-            except Exception:
+                shift_count = fetch_and_store_shifts(conn, game_id)
+            except Exception as e:                  # logged and retried next run (backfill_shifts)
                 shift_count = 0
+                log_failure(f"[{i+1}/{len(new_ids)}] Game {game_id} shifts FAILED (will retry): {e}")
 
             print(
                 f"  [{i+1}/{len(new_ids)}] "
@@ -155,6 +240,9 @@ def main():
             )
         except Exception as e:
             log_failure(f"[{i+1}/{len(new_ids)}] Game {game_id} FAILED: {e}")
+
+    # 6b. Retry shift charts that are missing (earlier failures, or posted late)
+    backfill_shifts(conn)
 
     # 7. Derive shot context (rebound / rush flags) for any new games.
     # Processing step, kept out of the per-game acquisition loop on purpose.

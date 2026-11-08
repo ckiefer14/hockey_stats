@@ -9,7 +9,7 @@ Usage (from the project root):
     py -m src.pipelines.fit_hierarchical                      # v1.1, last 365 days of data (Phase 7 choice)
     py -m src.pipelines.fit_hierarchical --end 2026-12-01     # window ends the day before this date
     py -m src.pipelines.fit_hierarchical --model goals --window 730   # Track B v1, for comparison
-    py -m src.pipelines.fit_hierarchical --model tv                   # Track B v2.0 + back-to-backs, 730 days, weekly
+    py -m src.pipelines.fit_hierarchical --model tv                   # Track B v2.0 + back-to-backs + lineup, 730 days, weekly
     py -m src.pipelines.fit_hierarchical --model tv --step-days 2     # v2.0 with about one step per game
     py -m src.pipelines.fit_hierarchical --model tv --draws 2000      # longer run: cleaner R-hat / ESS
     py -m src.pipelines.fit_hierarchical --overwrite
@@ -179,6 +179,42 @@ def unscored_games(conn, start, end=None) -> pd.DataFrame:
     return df[keep]
 
 
+def lineup_staleness(conn) -> str | None:
+    """Why the v2.2 lineup tables are not current (None if they are)."""
+    q = lambda sql: conn.execute(sql).fetchone()[0]
+    try:
+        last_game = q("""SELECT MAX(s.game_date) FROM skater_game_stats k JOIN schedule s ON s.game_id = k.game_id
+                         JOIN games g ON g.id = k.game_id WHERE g.game_type = 2""")
+        last_stint = q("SELECT MAX(s.game_date) FROM stint_games sg JOIN schedule s ON s.game_id = sg.game_id")
+        last_ctx = q("SELECT MAX(s.game_date) FROM lineup_context lc JOIN schedule s ON s.game_id = lc.game_id")
+        last_fit = q("SELECT MAX(fit_date) FROM lineup_fits")
+    except Exception:
+        return ("the lineup tables do not exist yet  ->  py -m src.pipelines.build_stints, then "
+                "py -m src.pipelines.build_lineup_asof --start 2022-10-01")
+    if last_game is None:
+        return None
+    lg = pd.Timestamp(last_game)
+    if last_stint is None or pd.Timestamp(last_stint) < lg - pd.Timedelta(days=2):
+        return f"stints end {last_stint}, games loaded to {last_game}  ->  py -m src.pipelines.build_stints"
+    if last_ctx is None or pd.Timestamp(last_ctx) < lg:
+        return f"lineup context ends {last_ctx}, games loaded to {last_game}  ->  py -m src.pipelines.build_lineup_asof"
+    if last_fit is None or pd.Timestamp(last_fit) < lg - pd.Timedelta(days=14):
+        return f"newest player-rating fit {last_fit} is over 14 days old  ->  py -m src.pipelines.build_lineup_asof"
+    return None
+
+
+def layer_staleness(conn, start) -> str | None:
+    """Why the v2.1 as-of layer tables are not current (None if they are)."""
+    try:
+        miss = conn.execute("""SELECT COUNT(*) FROM shot_xg x JOIN schedule s ON s.game_id = x.game_id
+                               LEFT JOIN shot_xg_layer l ON l.game_id = x.game_id AND l.event_id = x.event_id
+                               WHERE l.game_id IS NULL AND x.xg IS NOT NULL AND s.game_date >= ?""",
+                            (str(pd.Timestamp(start).date()),)).fetchone()[0]
+    except Exception:
+        return "the xG layer tables do not exist yet"
+    return f"{miss:,} scored shots have no as-of layer xG yet" if miss else None
+
+
 def priors(model: str) -> dict:
     if model == "tv":
         return {
@@ -219,6 +255,19 @@ def main():
     parser.add_argument("--rest", action=argparse.BooleanOptionalAction, default=None,
                         help="back-to-back effects (default: on for --model tv, adopted in v2.0d; --no-rest turns them off)")
     parser.add_argument("--home-drift", action="store_true", help="v2.0d: home ice changes by season")
+    parser.add_argument("--rest-goals", action="store_true",
+                        help="v2.0e: back-to-back effects on goals per xG (finishing, goaltending)")
+    parser.add_argument("--travel", action="store_true",
+                        help="v2.0f: overnight travel, time zones, 3 games in 4 nights")
+    parser.add_argument("--xg-layer", action="store_true",
+                        help="v2.1: team xG adjusted for the shooters' finishing (as of each week; build_xg_asof)")
+    parser.add_argument("--goalie-layer", action="store_true",
+                        help="v2.1: goalie offsets from the xG layer instead of the Phase 3 rating")
+    parser.add_argument("--lineup", action=argparse.BooleanOptionalAction, default=None,
+                        help="v2.2 lineup strength vs usual (default: on for --model tv, adopted 2026-11-08; "
+                             "--no-lineup turns it off; needs build_stints + build_lineup_asof)")
+    parser.add_argument("--goalie-rest", action="store_true",
+                        help="v2.0g: starting goalie on zero rest (also started yesterday)")
     parser.add_argument("--draws", type=int, default=DRAWS,
                         help=f"posterior draws per chain (default {DRAWS}; 2000 gives cleaner R-hat / ESS, about 2x time)")
     parser.add_argument("--tune", type=int, default=TUNE, help=f"tuning steps per chain (default {TUNE})")
@@ -236,14 +285,18 @@ def main():
         raise SystemExit("--half-life is only supported with --model xg")
     if args.rest is None:
         args.rest = args.model == "tv"                 # v2.0d: rest effects on by default for v2.0
-    if (args.rest or args.home_drift) and args.model != "tv":
-        raise SystemExit("--rest / --home-drift need --model tv")
+    if args.lineup is None:
+        args.lineup = args.model == "tv"               # v2.2: lineup term on by default for v2.0
+    if (args.rest or args.home_drift or args.rest_goals or args.travel or args.goalie_rest or args.lineup) \
+            and args.model != "tv":
+        raise SystemExit("--rest / --home-drift / --rest-goals / --travel / --goalie-rest need --model tv")
     if args.window is None:
         args.window = DEFAULT_TV_WINDOW if args.model == "tv" else DEFAULT_WINDOW_DAYS
 
     # 1. Data and window
     conn = get_connection()
-    gt_all, _ = build_game_table(conn, all_seasons(conn))
+    gt_all, _ = build_game_table(conn, all_seasons(conn), xg_layer=args.xg_layer, goalie_layer=args.goalie_layer,
+                                 lineup=args.lineup)
     end = pd.Timestamp(args.end) if args.end else gt_all["game_date"].max().normalize() + pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=args.window)
 
@@ -251,6 +304,16 @@ def main():
     #     Games without shot_xg rows are missing from the game table, so without this
     #     check the fit would quietly use old data.
     missing = unscored_games(conn, start, pd.Timestamp(args.end) if args.end else None)
+    if args.lineup:                                     # v2.2: stints and player ratings must be current
+        stale = lineup_staleness(conn)
+        if stale:
+            conn.close()
+            raise SystemExit(f"STOP  {stale}")
+    if args.xg_layer or args.goalie_layer:              # v2.1: the as-of layer tables must be current
+        stale = layer_staleness(conn, start)
+        if stale:
+            conn.close()
+            raise SystemExit(f"STOP  {stale}  ->  py -m src.pipelines.build_xg_asof, then rerun this fit.")
     conn.close()
     if len(missing) and not args.skip_xg_check:
         by_season = missing.groupby("season").size()
@@ -267,7 +330,9 @@ def main():
     seasons = sorted(gt["season"].astype(str).unique())
 
     # 2. Paths and overwrite protection
-    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift)
+    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift,
+                        args.rest_goals, args.travel, args.goalie_rest, args.xg_layer, args.goalie_layer,
+                        args.lineup)
     POSTERIOR_DIR.mkdir(parents=True, exist_ok=True)
     stem = POSTERIOR_DIR / f"{label}_{end:%Y%m%d}"
     nc_path = stem.with_suffix(".nc")
@@ -290,7 +355,8 @@ def main():
     grid = None
     if args.model == "tv":
         model, grid = htv.build_model_tv(gt, teams, step_days=args.step_days, rest=args.rest,
-                                         home_drift=args.home_drift)
+                                         home_drift=args.home_drift, rest_goals=args.rest_goals,
+                                         travel=args.travel, goalie_rest=args.goalie_rest, lineup=args.lineup)
         print(f"Time steps: {len(grid['gap_days'])} of {args.step_days} days "
               f"({int(grid['summer'].sum())} off-season)")
     elif args.model == "xg":
@@ -306,7 +372,10 @@ def main():
 
     # 4. Diagnose
     league_terms = LEAGUE_TERMS_BY_MODEL[args.model] + (
-        (htv.REST_VARS if args.rest else []) + (["tau_home_summer"] if args.home_drift else [])
+        (htv.REST_VARS if args.rest else []) + (htv.REST_GOAL_VARS if args.rest_goals else [])
+        + (htv.TRAVEL_VARS if args.travel else []) + (htv.GOALIE_REST_VARS if args.goalie_rest else [])
+        + (htv.LINEUP_VARS if args.lineup else [])
+        + (["tau_home_summer"] if args.home_drift else [])
         if args.model == "tv" else [])
     diag = diagnostics(idata, league_terms, TEAM_TERMS_BY_MODEL[args.model])
 
@@ -340,7 +409,8 @@ def main():
         "window_days": args.window,
         "half_life_days": args.half_life,
         "step_days": args.step_days if args.model == "tv" else None,
-        "rest": bool(args.rest), "home_drift": bool(args.home_drift),
+        "rest": bool(args.rest), "home_drift": bool(args.home_drift), "rest_goals": bool(args.rest_goals), "travel": bool(args.travel), "goalie_rest": bool(args.goalie_rest),
+        "xg_layer": bool(args.xg_layer), "goalie_layer": bool(args.goalie_layer), "lineup": bool(args.lineup),
         "window_start": str(start.date()),
         "window_end_excluded": str(end.date()),
         "seasons": seasons,
@@ -377,7 +447,8 @@ def main():
             "window_days": args.window,
             "half_life_days": args.half_life,
             "step_days": args.step_days if args.model == "tv" else None,
-            "rest": bool(args.rest), "home_drift": bool(args.home_drift),
+            "rest": bool(args.rest), "home_drift": bool(args.home_drift), "rest_goals": bool(args.rest_goals), "travel": bool(args.travel), "goalie_rest": bool(args.goalie_rest),
+        "xg_layer": bool(args.xg_layer), "goalie_layer": bool(args.goalie_layer), "lineup": bool(args.lineup),
             "start": str(start.date()),
             "end": str(end.date()),
             "seasons": seasons,

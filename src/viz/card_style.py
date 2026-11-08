@@ -104,7 +104,7 @@ def card_background(fig, rects) -> None:
         fig.patches.append(FancyBboxPatch(
             (x0, y0), x1 - x0, y1 - y0,
             boxstyle="round,pad=0,rounding_size=0.008",
-            transform=fig.transFigure, facecolor=SURFACE,
+            transform=getattr(fig, "transSubfigure", fig.transFigure), facecolor=SURFACE,
             edgecolor=(0.043, 0.043, 0.043, 0.10), linewidth=0.8, zorder=-10))
 
 

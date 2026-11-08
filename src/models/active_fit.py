@@ -58,7 +58,8 @@ def window_games(conn, info: dict | None = None) -> tuple[pd.DataFrame, list[str
     """The games the active fit was trained on (same rows and team order as the fit)."""
     from src.processing.game_table import build_game_table, select_window
     info = info or read_active()
-    gt_all, _ = build_game_table(conn, info["seasons"])
+    gt_all, _ = build_game_table(conn, info["seasons"], xg_layer=info.get("xg_layer", False),
+                                 goalie_layer=info.get("goalie_layer", False), lineup=info.get("lineup", False))
     gt, teams = select_window(gt_all, info["start"], info["end"])
     if teams != info["teams"]:
         raise SystemExit("The games in the active window no longer match the fit's teams "

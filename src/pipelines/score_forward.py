@@ -28,7 +28,7 @@ from src.validation.scoring import score_models, calibration_table, score_output
 from src.data.odds import consensus
 
 FORWARD_DIR = OUTPUT_DIR / "forward"
-BACKTEST_LOG_LOSS = 0.6732          # v2.0d: Track B v2.0 + back-to-backs, 2,624 held-out games
+BACKTEST_LOG_LOSS = 0.6671          # v2.2: Track B v2.0 + rest + lineup, 3,936 held-out games (2023-26)
 COIN_FLIP = float(np.log(2))
 
 
@@ -92,7 +92,7 @@ def main():
     print(table.drop(columns=["games", "intercept"]).round(4).to_string(index=False))
     ll = log_loss(df["p_home"], df["home_won"])
     se = np.std(-(df["home_won"] * np.log(df["p_home"]) + (1 - df["home_won"]) * np.log(1 - df["p_home"]))) / np.sqrt(len(df))
-    print(f"Live log loss {ll:.4f} ± {1.645 * se:.4f} (90%); backtest (v2.0 + rest) {BACKTEST_LOG_LOSS:.4f}; coin flip {COIN_FLIP:.4f}")
+    print(f"Live log loss {ll:.4f} ± {1.645 * se:.4f} (90%); backtest (v2.0 + rest + lineup) {BACKTEST_LOG_LOSS:.4f}; coin flip {COIN_FLIP:.4f}")
     if len(df) < 300:
         print(f"Only {len(df)} games: the range is wide. Differences of 0.005 need roughly 1,000+ games to show.")
 

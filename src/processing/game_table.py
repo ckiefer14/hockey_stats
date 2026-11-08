@@ -31,6 +31,43 @@ def starting_goalies(conn: sqlite3.Connection) -> pd.DataFrame:
     """, conn)
 
 
+GOALIE_REST_COLS = ["grest_home", "grest_away", "g2b_home", "g2b_away"]
+
+
+def _goalie_starts(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Every regular-season start: goalie_id, game_id, game_date (one row per goalie per game)."""
+    return pd.read_sql("""
+        SELECT  g.player_id AS goalie_id, g.game_id, s.game_date
+        FROM    goalie_game_stats g
+        JOIN    schedule s ON s.game_id = g.game_id
+        WHERE   g.starter = 1
+    """, conn, parse_dates=["game_date"]).drop_duplicates(["goalie_id", "game_id"])
+
+
+def goalie_rest(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Days since each start's goalie last started (any team), and whether that was yesterday.
+
+    Columns: game_id, goalie_id, grest (NaN for a goalie's first start on record), g2b (1 if he
+    also started the day before: a goalie on zero rest, v2.0g).
+    """
+    st = _goalie_starts(conn).sort_values(["goalie_id", "game_date", "game_id"])
+    st["grest"] = st.groupby("goalie_id")["game_date"].diff().dt.days
+    st["g2b"] = (st["grest"] == 1).astype(int)
+    return st[["game_id", "goalie_id", "grest", "g2b"]]
+
+
+def goalie_rest_on_date(conn: sqlite3.Connection, goalie_id, date) -> float:
+    """Days since `goalie_id`'s last start before `date` (NaN if unknown). For live predictions."""
+    if goalie_id is None or pd.isna(goalie_id):
+        return float("nan")
+    last = pd.read_sql("""
+        SELECT  MAX(s.game_date) AS last
+        FROM    goalie_game_stats g JOIN schedule s ON s.game_id = g.game_id
+        WHERE   g.starter = 1 AND g.player_id = ? AND s.game_date < ?
+    """, conn, params=(int(goalie_id), str(pd.Timestamp(date).date())))["last"].iloc[0]
+    return float((pd.Timestamp(date).normalize() - pd.Timestamp(last)).days) if last else float("nan")
+
+
 def regulation_goals(conn: sqlite3.Connection) -> pd.DataFrame:
     """Goals in periods 1-3 per game, empty-net goals excluded.
 
@@ -51,16 +88,19 @@ def regulation_goals(conn: sqlite3.Connection) -> pd.DataFrame:
     """, conn)
 
 
-def regulation_xg(conn: sqlite3.Connection) -> pd.DataFrame:
+def regulation_xg(conn: sqlite3.Connection, layer: bool = False) -> pd.DataFrame:
     """Expected goals in periods 1-3 per game (shots in shot_xg, so no empty-net shots).
 
+    layer (v2.1): use shot_xg_layer.xg_shooter (LightGBM adjusted for the shooters' finishing,
+    as of before each game; build_xg_asof.py) instead of LightGBM's xG.
     Columns: game_id, home_xg_reg, away_xg_reg
     """
-    return pd.read_sql("""
+    src = ("(SELECT game_id, event_id, xg_shooter AS xg FROM shot_xg_layer)" if layer else "shot_xg")
+    return pd.read_sql(f"""
         SELECT  se.game_id,
                 SUM(CASE WHEN se.team_id = s.home_team_id THEN x.xg ELSE 0 END) AS home_xg_reg,
                 SUM(CASE WHEN se.team_id = s.away_team_id THEN x.xg ELSE 0 END) AS away_xg_reg
-        FROM    shot_xg x
+        FROM    {src} x
         JOIN    shot_events se ON se.game_id = x.game_id AND se.event_id = x.event_id
         JOIN    schedule s     ON s.game_id = se.game_id
         WHERE   se.period <= 3
@@ -88,9 +128,34 @@ def goalie_gamma(gg: pd.DataFrame, dates) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def goalie_gamma_layer(conn: sqlite3.Connection, dates) -> pd.DataFrame:
+    """v2.1: each goalie's xG-layer rating as of each game date (latest weekly fit made on or
+    before the date, which used only earlier shots; build_xg_asof.py). Same scale and sign as
+    goalie_gamma (log goal-rate multiplier, positive = better). Goalies the fit had not seen: none.
+    Columns: game_date, goalie_id, gamma
+    """
+    g = pd.read_sql("SELECT fit_date, goalie_id, gamma FROM goalie_layer_asof", conn, parse_dates=["fit_date"])
+    if g.empty:
+        raise SystemExit("goalie_layer_asof is empty. Run: py -m src.pipelines.build_xg_asof")
+    d = pd.DataFrame({"game_date": pd.to_datetime(sorted(set(dates)))})
+    fits = np.sort(g["fit_date"].unique())
+    idx = np.searchsorted(fits, d["game_date"].to_numpy(), side="right") - 1
+    d["fit_date"] = [fits[i] if i >= 0 else pd.NaT for i in idx]
+    return d.dropna().merge(g, on="fit_date")[["game_date", "goalie_id", "gamma"]]
+
+
+def layer_rating(conn: sqlite3.Connection, goalie_id, date) -> float:
+    """One goalie's xG-layer gamma as of `date` (live predictions); 0.0 if not rated yet."""
+    if goalie_id is None or pd.isna(goalie_id):
+        return 0.0
+    r = conn.execute("""SELECT gamma FROM goalie_layer_asof WHERE goalie_id = ? AND fit_date <= ?
+                        ORDER BY fit_date DESC LIMIT 1""", (int(goalie_id), str(pd.Timestamp(date).date()))).fetchone()
+    return float(r[0]) if r else 0.0
+
+
 # Relocated franchises: one team for the models (same roster and staff). Arizona moved to
 # Utah after 2023-24; without this, Utah starts from zero and ARI keeps a data-free rating.
-FRANCHISE = {"ARI": "UTA"}
+from src.processing.schedule_context import FRANCHISE, schedule_context, CONTEXT_COLS  # noqa: F401
 
 
 def _schedule_games(conn: sqlite3.Connection) -> pd.DataFrame:
@@ -132,7 +197,16 @@ def rest_on_date(conn: sqlite3.Connection, team: str, date) -> float:
     return float((d - prev.max()).days) if len(prev) else float("nan")
 
 
-def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.DataFrame, list[str]]:
+def lineup_shift(conn: sqlite3.Connection) -> pd.DataFrame:
+    """v2.2: lin_home / lin_away per game (build_lineup_asof.py). Games without one: 0."""
+    try:
+        return pd.read_sql("SELECT game_id, lin_home, lin_away FROM lineup_context", conn)
+    except Exception:
+        raise SystemExit("lineup_context does not exist. Run: py -m src.pipelines.build_lineup_asof")
+
+
+def build_game_table(conn: sqlite3.Connection, seasons: list[str], xg_layer: bool = False,
+                     goalie_layer: bool = False, lineup: bool = False) -> tuple[pd.DataFrame, list[str]]:
     """One row per game in `seasons` for the Track B model.
 
     Columns: game_id, game_date, season, home, away, home_idx, away_idx,
@@ -175,13 +249,14 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
         df[["home_goals_reg", "away_goals_reg"]].fillna(0).astype(int))
 
     # 2c. Regulation xG (the information Track B v1.1 rates teams on)
-    df = df.merge(regulation_xg(conn), on="game_id", how="left")
+    df = df.merge(regulation_xg(conn, layer=xg_layer), on="game_id", how="left")
     df[["home_xg_reg", "away_xg_reg"]] = df[["home_xg_reg", "away_xg_reg"]].fillna(0.0)
 
     # 3. Gammas: goalie_gamma on the unique dates, merged twice; fill missing with 0
     gg = goalie_game_xg(conn)
     df["game_date"] = pd.to_datetime(df["game_date"])
-    gammas = goalie_gamma(gg, df["game_date"])
+    gammas = (goalie_gamma_layer(conn, df["game_date"]) if goalie_layer      # v2.1: xG-layer goalie rating
+              else goalie_gamma(gg, df["game_date"]))
 
     df = df.merge(
         gammas.rename(columns={"goalie_id": "home_goalie", "gamma": "gamma_home"}),
@@ -195,11 +270,28 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
 
     df[["gamma_home", "gamma_away"]] = df[["gamma_home", "gamma_away"]].fillna(0.0)
 
-    # 3b. Rest: days since each team's previous game, back-to-back flags (from the schedule)
-    df = df.merge(team_rest(conn), on="game_id", how="left")
-    df[["b2b_home", "b2b_away"]] = df[["b2b_home", "b2b_away"]].fillna(0).astype(int)
+    # 3b. Schedule context (from the schedule): rest days, back-to-backs, travel since the
+    #     last game, time zones crossed, 3 games in 4 nights (schedule_context.py)
+    df = df.merge(schedule_context(conn), on="game_id", how="left")
+    fill = [c for c in CONTEXT_COLS if not c.startswith("rest")]
+    df[fill] = df[fill].fillna(0)
+    df[["b2b_home", "b2b_away", "dense_home", "dense_away"]] = (
+        df[["b2b_home", "b2b_away", "dense_home", "dense_away"]].astype(int))
 
-    # 3c. Relocated franchises count as one team (after the goalie / starter merges,
+    # 3b'. Lineup strength vs the team's usual lineup (v2.2; 0 where not built)
+    if lineup:
+        df = df.merge(lineup_shift(conn), on="game_id", how="left")
+    for c in ("lin_home", "lin_away"):
+        df[c] = df[c].fillna(0.0) if c in df else 0.0
+
+    # 3c. Goalie rest: days since each starter's previous start, zero-rest flag (v2.0g)
+    gr = goalie_rest(conn)
+    for side in ("home", "away"):
+        df = df.merge(gr.rename(columns={"goalie_id": f"{side}_goalie", "grest": f"grest_{side}", "g2b": f"g2b_{side}"}),
+                      on=["game_id", f"{side}_goalie"], how="left")
+    df[["g2b_home", "g2b_away"]] = df[["g2b_home", "g2b_away"]].fillna(0).astype(int)
+
+    # 3d. Relocated franchises count as one team (after the goalie / starter merges,
     #     which use the abbreviation of the season)
     df[["home", "away"]] = df[["home", "away"]].replace(FRANCHISE)
 
@@ -216,7 +308,7 @@ def build_game_table(conn: sqlite3.Connection, seasons: list[str]) -> tuple[pd.D
     cols = ["game_id", "game_date", "season", "home", "away", "home_idx", "away_idx",
             "home_goals", "away_goals", "home_goals_reg", "away_goals_reg",
             "home_xg_reg", "away_xg_reg", "home_goalie", "away_goalie",
-            "gamma_home", "gamma_away", "rest_home", "rest_away", "b2b_home", "b2b_away"]
+            "gamma_home", "gamma_away"] + CONTEXT_COLS + GOALIE_REST_COLS + ["lin_home", "lin_away"]
     return df[cols], teams
 
 def select_window(gt: pd.DataFrame, start, end) -> tuple[pd.DataFrame, list[str]]:

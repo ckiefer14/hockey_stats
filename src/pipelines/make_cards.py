@@ -99,8 +99,51 @@ def _score_matrix(table, p_home_win: float) -> np.ndarray:
 
 def _model_label(fit_file: str) -> str:
     stem = Path(str(fit_file)).stem
-    version = "Track B v1.1" if stem.startswith("trackbxg") else "Track B"
+    if stem.startswith("trackbtv"):
+        extras = [n for tag, n in (("_r", "rest"), ("lu", "lineup")) if tag in stem]
+        version = "Track B v2" + (f" ({' + '.join(extras)})" if extras else "")
+    else:
+        version = "Track B v1.1" if stem.startswith("trackbxg") else "Track B"
     return f"{version} · {stem}"
+
+
+PLAYOFF_DIR = OUTPUT_DIR / "playoffs"
+
+
+def playoff_odds_on(date: str) -> tuple[pd.DataFrame | None, str | None]:
+    """The latest playoff_odds_<d>.csv with d <= date (run playoff_odds weekly), or (None, None)."""
+    runs = sorted(f for f in PLAYOFF_DIR.glob("playoff_odds_????-??-??.csv")
+                  if f.stem[-10:] <= str(date)[:10]) if PLAYOFF_DIR.exists() else []
+    if not runs:
+        return None, None
+    return pd.read_csv(runs[-1]).set_index("team"), runs[-1].stem[-10:]
+
+
+def _get(row, key):
+    try:
+        v = row[key]
+    except (KeyError, IndexError):
+        return None
+    return None if v is None or (isinstance(v, float) and np.isnan(v)) else v
+
+
+def pregame_context(row, side: str, odds: pd.DataFrame | None, odds_date: str | None) -> dict | None:
+    """The v2 context band for one team from a logged prediction (None for old rows without it)."""
+    from src.processing.schedule_context import FRANCHISE
+    team = row[side]
+    c = {k: _get(row, f"{k}_{side}") for k in ("rest", "b2b", "dense", "km", "g2b", "lin")}
+    c["lineup_source"] = _get(row, f"lineup_source_{side}")
+    c["lineup_notes"] = _get(row, f"lineup_notes_{side}") or ""
+    if c["lineup_source"] is None:
+        c["lin"] = None                                # model without the lineup term
+    t = FRANCHISE.get(team, team)
+    if odds is not None and t in odds.index:
+        o = odds.loc[t]
+        c["playoff"] = {k: float(o[k]) for k in ("p_playoffs", "points_now", "gp_now", "points_mean",
+                                                 "points_lo", "points_hi")} | {"date": odds_date}
+    if all(v is None for k, v in c.items() if k != "lineup_notes") and "playoff" not in c:
+        return None
+    return c
 
 
 # --------------------------------------------------------------------------
@@ -117,6 +160,8 @@ def pregame_card(row, res: dict, sims: pd.DataFrame, conn) -> Path:
     """
     from src.analysis.aggregation import final_from_sims
     from src.viz.postgame_card import player_names
+    from dataclasses import replace
+
     from src.viz.pregame_card import PregameData, plot_pregame_card
 
     home, away, date = row["home"], row["away"], str(row["game_date"])[:10]
@@ -147,6 +192,9 @@ def pregame_card(row, res: dict, sims: pd.DataFrame, conn) -> Path:
         away_goalie_confirmed=row["away_goalie_source"] != "default",
         model_label=_model_label(row["fit_file"]),
     )
+    odds, odds_date = playoff_odds_on(date)
+    data = replace(data, home_ctx=pregame_context(row, "home", odds, odds_date),
+                   away_ctx=pregame_context(row, "away", odds, odds_date))
     return _save(plot_pregame_card(data), card_path(date, home, away, "pregame"))
 
 

@@ -23,7 +23,7 @@ All of these come from the same underlying machinery — a hierarchical Bayesian
 
 ## Status
 
-*Last updated: 2026-11-02*
+*Last updated: 2026-11-08*
 
 | Phase | Status | Result |
 |---|---|---|
@@ -38,7 +38,10 @@ All of these come from the same underlying machinery — a hierarchical Bayesian
 | v2.0 Time-varying ratings | **Done, live model** | Team ratings and league levels drift week to week. Walk-forward log loss **0.6749** vs v1.1 0.6773 (**−0.0025 [−0.0040, −0.0009], clear**), ties/edges rolling xG (0.6754), calibration slope 0.98; blending with rolling xG no longer clearly helps. Weekly = 2-day steps |
 | v2.0b Follow-ups | **Done** (backtest parts) | Early season fine, favorites calibrated, wrong guessed starter costs ~0.0001; **away back-to-backs badly under-called** (home won 62.0%, predicted 53.4%) → v2.0d |
 | v2.0d Back-to-backs | **Done, live model** | Back-to-back effects on shot quality: log loss **0.6732**, **−0.0016 [−0.0026, −0.0006] vs v2.0 (clear)**, −0.0041 vs v1.1, slope 1.02; blend gap gone (0.0004). Home-ice drift tested, adds nothing. ARI → UTA merged |
-| v2 (remaining) | In progress | Forward test and odds logging running; next: rest on finishing/goaltending (optional), v2.0c analysis B, hierarchical xG layer, lineup model; see *v2 — Planned Improvements* |
+| v2.0e / v2.0f Rest on finishing, travel | **Tested, not adopted** | Rest on goals per xG −0.0004 [−0.0009, +0.0001] vs live (within luck); travel, time zones, 3-in-4 +0.0000. The away back-to-back gap (−0.056) is not about travel, backups or a goalie on zero rest (v2.0g check); remaining value at most ~0.001 log loss → chapter closed |
+| v2.1 Hierarchical xG layer | **Built, not adopted for games** | Shot level: shooter finishing helps every held-out season (−0.0002 to −0.0003 per shot), goalie skill once 4+ seasons of history; rink and season × type dropped. Game level vs live: layer goalie −0.0003 [−0.0016, +0.0011], + shooter-adjusted xG −0.0004 [−0.0019, +0.0012], within luck, calibration 0.94–0.96 |
+| v2.2 Lineup model | **Done, live model since 2026-11-08** | Shift data fixed and backfilled, stints, ridge and Bayesian RAPM validated. Game level vs live (3,936 games): −0.0009 [−0.0020, +0.0002], within luck (about 94% likely better), leans better in 2 of 3 seasons. **Adopted** (a judgment call: 6% risk accepted) with live lineups from ESPN injuries + the NHL game-day roster; recheck with 2026-27 |
+| v2 (remaining) | In progress | Forward test and odds logging running (now v2.0 + rest + lineup); calibration checked (fine). Playoff odds done (v2.4). Next: **v2 visuals** (lineups/rest/ranges on cards, team rating trends, player cards, playoff chart), then v2.0c analysis B and v2.3 extras; v2.2 recheck in spring 2027 |
 
 **Check current state:** `py .\scripts\check_state.py` lists which files and tables exist and whether `shot_context` matches the current derivation code.
 
@@ -150,7 +153,7 @@ hockey-stats/
 │   │       ├── hierarchical.py # DONE: Track B v1 PyMC model, sample_scores, simulate_league
 │   │       ├── hierarchical_xg.py # DONE: Track B v1.1 (ratings from xG + goals), simulate_league_xg
 │   │       ├── hierarchical_tv.py # DONE: Track B v2.0 (time-varying ratings, live model), simulate_league_tv
-│   │       ├── xg_hierarchical.py # v2: Bayesian layer on top of LightGBM xG
+│   │       ├── xg_layer.py        # v2.1: hierarchical layer on top of LightGBM xG (Laplace fit)
 │   │       ├── lineup_rapm.py  # v2: Bayesian RAPM player effects
 │   │       ├── montecarlo.py   # DONE: tie-inflated and score-state game simulators
 │   │       └── pce.py          # DONE: PCE (ported from soil), Sobol' from coefficients, Saltelli, Ishigami test
@@ -1111,9 +1114,63 @@ Run in `notebooks/v2_followups.ipynb` on the v2.0 walk-forward backtest files.
 
 Home back-to-backs are essentially fixed; away back-to-backs about a third fixed.
 
-**Open item — rest on finishing and goaltending.** Rest currently only changes shot quality (xG). A tired team may also finish worse, and a team on a back-to-back often starts its backup or a tired goalie, so more of the same shots go in. That part can't show up through xG. Next test: a second set of rest effects on goals per xG ($\delta$), checked against the remaining −0.056 away bias the same way.
+### v2.0e — Rest on Finishing and Goaltending — TESTED, NOT ADOPTED (2026-11-02)
 
-### v2.1 — Hierarchical xG Layer
+**Idea:** a tired team may also finish worse, and its goalie (often the backup) lets in more of the same shots; v2.0d only lets rest change xG. **Model:** four more effects on goals per xG (`rest_fin_home/away`, `rest_gk_home/away`, Normal(0, 0.1)); `--rest-goals` in `fit_hierarchical` / `backtest_season`, label `_rg`. Synthetic recovery: effects recovered when present (wider ranges than the xG terms; goals are noisier), all include 0 when absent.
+
+**Result:** vs the live model (v2.0 + rest) −0.0004 [−0.0009, +0.0001], **within luck → not adopted** (kept in the code; retest when 2026-27 adds a season). It moved the bias the most of anything tried: away back-to-back −0.056 → −0.042, home back-to-back +0.018 → −0.001. Calibration 1.01.
+
+### v2.0f — Travel, Time Zones, 3 Games in 4 Nights — TESTED, NOT ADOPTED (2026-11-03)
+
+**Idea:** the road team on a back-to-back usually flew in overnight. **Files:** `src/processing/schedule_context.py` (new): arena locations (`ARENAS`, city-level, standard UTC offsets), per game and side `rest`, `b2b`, `km` (since the last game), `trav` (= b2b × km / 1000), `tz` (time zones crossed, rest ≤ 2 days), `dense` (3rd game in 4 nights); neutral-site games found from `games.venue` (travel counts 0). All from the schedule, so known before puck drop. The game table, backtest outputs and the predictions log carry these columns. **Model:** six effects on log xG rate shared by home and road (`trav_off/def`, `tz_off/def`, `dense_off/def`); `--travel`, label `_rt`. `context_shift(draws, context)` replaces `rest_shift` for all fits. Synthetic recovery passed (18 of 20 terms in their 90% ranges across both cases; b2b, travel and 3-in-4 overlap, so credit is split imperfectly, the total is well determined).
+
+**Result:** vs the live model +0.0000 [−0.0003, +0.0004] → **not adopted.** By trip length the away back-to-back bias is the same for short (−0.048, under 500 km) and medium (−0.059, 500–1,200 km) trips; crossing 2+ time zones shows no gap (−0.027); 3-in-4 small (−0.025). **The away back-to-back gap is not travel.** Since v2.0e (which includes goaltending) helped most, the next check is whether it sits in games the backup started (`v2_followups.ipynb`, "Back-to-backs × backup goalies"): if so, goalie ratings are too shrunk and the fix is the v2.1 goalie layer.
+
+**Also found:** `predict_day` silently dropped new log columns (it reindexed to the file's old columns), so since v2.0d the rest columns were not logged (the logged probabilities were right). Fixed: new columns are added to the file. **`scripts/check_backtests.py`** checks every backtest file (one row per game, full coverage, no duplicates) and the game table; both notebooks now drop duplicated games and leave out models without a prediction for every game, with a message. Run it before the notebooks.
+
+
+### v2.0g — Goalie on Zero Rest — CHECKED, NOT BACKTESTED (2026-11-03)
+
+**Why:** splitting away back-to-backs by goalie, the bias sat in games the **usual starter** played (140 games, −0.121 vs the live model) while backup starts were fine (276 games, −0.024; rested backups +0.027). So it looked like goalie fatigue, not under-rated backups. **Built:** `goalie_rest(conn)` / `goalie_rest_on_date` in `game_table.py` (days since the starter's previous start; `g2b` = he also started yesterday), game-table columns `grest_*`, `g2b_*`, model term `gk_b2b` (opponent's goals per xG, Normal(0, 0.15)), `--goalie-rest`, label `_rk`; `predict_day` tags such games. Synthetic recovery passed.
+
+**Check on the exact feature (no backtest needed):** goalies almost never start both nights: **40** away games in two seasons, bias **+0.065** (wrong sign, noise ±0.13). Away back-to-backs with a fresh goalie: 491 games, −0.070. The "usual starter" games are mostly the starter returning rested after the backup played the first night. **Not goalie fatigue → not backtested;** the code stays, off by default.
+
+**Back-to-back chapter closed.** Five ideas tested (rest, home drift, rest on finishing, travel, goalie rest); only rest (v2.0d) was adopted. The remaining away back-to-back miss (−0.056 on 416 of 2,624 games) is worth at most about 0.001 log loss even if fixed perfectly (bias² / 2p(1−p) × share of games), and ~15 subsets were examined, so part of it may be chance. Further gains must come from items that touch every game (v2.1, v2.2).
+
+### v2.1 — Hierarchical xG Layer — BUILT, NOT ADOPTED FOR GAMES (2026-11-06)
+
+**Files:**
+- `src/models/stochastic/xg_layer.py` — `load_shots`, `fit_laplace` (production fitter), `build_xg_layer` (PyMC, for checking), `adjusted_logit`, `effect_draws`, `simulate_goals`.
+- `src/pipelines/fit_xg_layer.py` — `--holdout` (walk-forward shot test, per-term ablation, goals vs expected by shot type and rink), `--final` (fit all, top/bottom lists, predictive check, save `output/posteriors/xg_layer_<season>[_bg]*`), `--terms` (subset, refit without the others).
+- `src/pipelines/build_xg_asof.py` — weekly as-of refits on earlier shots only → `shot_xg_layer` (shooter-adjusted xG, `xg_base` for staleness), `goalie_layer_asof` (goalie gamma on Track B's scale), `xg_layer_fits`. Incremental: rebuilds the latest week, new weeks, and weeks with missing or rescored shots.
+- Game model options: `build_game_table(..., xg_layer, goalie_layer)`; `--xg-layer` / `--goalie-layer` in `fit_hierarchical` and `backtest_season` (labels `_lx`, `_lg`, `_lxg`); `active_fit.json` carries them so `late_game`, `score_state`, `predict_day` follow; `fit_hierarchical` stops if the as-of tables are behind.
+
+**Fitting: Laplace, not NUTS.** Plain NUTS on 581k Bernoulli rows did not finish 200 draws in 10 minutes (many hours for a full fit). The layer is fit like a mixed-effects logistic model (as `lme4::glmer`): Newton steps on a sparse design for the effects, sigmas at the mode of the Laplace marginal likelihood times their half-normal priors, effects Gaussian N(mode, H⁻¹). 9–30 s on the full data. **Checked against NUTS** on a 60k-shot subsample: effect means correlate 0.99–1.00, sds within 5–7% (Laplace slightly wider). **Synthetic recovery** (560k shots, realistic volumes): shooter sigma 0.154 vs 0.151 true, rink 0.053 vs 0.047, season × type 0.079 vs 0.076, goalie 0.100 vs 0.084; 90–100% of true effects inside their 90% ranges; all sigmas near 0 when there are no effects.
+
+**Shot-level results** (`--holdout`, fit on earlier seasons, score the next; per-shot log loss, negative = better):
+
+| Test season (training seasons) | All four terms | Shooter + goalie | Shooter | Goalie | Rink | Season × type |
+|---|---|---|---|---|---|---|
+| 2023-24 (2) | +0.00018 | −0.00004 | −0.00023 | +0.00014 | +0.00007 | +0.00024 |
+| 2024-25 (3) | −0.00032 | **−0.00030** | −0.00033 | −0.00001 | 0.00000 | +0.00001 |
+| 2025-26 (4) | −0.00023 | **−0.00025** | −0.00024 | −0.00007 | +0.00004 | −0.00002 |
+
+(The per-term columns for shooter and goalie come from the shooter + goalie fit; rink and season × type from the four-term fit.)
+
+- **Shooter finishing** helps every season. **Goalie skill** needs history: hurts with 2 seasons, neutral with 3, helps with 4. **Rink** recording bias is negligible once LightGBM is in (sigma 0.026, no rink beyond about ±3%, within chance): the Open Question on arena bias is answered. **Season × shot type**: the redirect drift is real (+0.18, +0.11, +0.03, −0.01, −0.22, −0.10 by season) but each season goes its own way, so carrying it forward hurts; both dropped.
+- Full fit (shooter + goalie, 581k shots): sigma_beta 0.153 [0.140, 0.167], sigma_gamma 0.073 [0.060, 0.089]. Top finishers Draisaitl (+0.44; 241 goals on 157 xG), Thompson, Robertson, Makar, Kaprizov; top goalies Shesterkin, Sorokin, Hellebuyck, Vasilevskiy, Ullmark. Predictive check: 98% of shooters and 96% of goalies inside their 90% intervals (slightly wide, the cautious side).
+
+**Game-level results** (walk-forward backtest, 2,624 games, vs the live model v2.0 + rest):
+
+| Variant | vs live | Calibration slope |
+|---|---|---|
+| + layer goalie (`_r_lg`) | −0.0003 [−0.0016, +0.0011] | 0.96 |
+| + layer goalie + shooter-adjusted xG (`_r_lxg`) | −0.0004 [−0.0019, +0.0012] | 0.94 |
+| live model | — | 1.02 |
+
+**Not adopted:** within luck, with ranges three times as wide as the rest variants (a new goalie rating moves many games both ways), and calibration slips below 1: the layer's goalie spread is wider than Phase 3's, so game predictions get more extreme than results justify. Phase 3's heavy shrinkage is about right for games even though the layer predicts shots better. The shooter signal at game level is mostly already in Track B's team finishing term. **Kept for v2.2:** shooter finishing pays off when the model knows who dresses tonight; the as-of tables are built for it. No weekly `build_xg_asof` needed until then.
+
+#### Original plan
 
 **Why a layer, not a fully Bayesian xG model.** LightGBM already pins down the shot-geometry function: with 562k shots, uncertainty in the distance/angle/shot-type curve is negligible next to game randomness and team-strength uncertainty. A fully Bayesian xG model would be slow on 562k shots and would need its nonlinear interactions written by hand, likely losing AUC. What LightGBM *can't* do is tell shooters, goalies and rinks apart, or let shot-type conversion drift by season. A small hierarchical model on top of it adds exactly that.
 
@@ -1146,7 +1203,7 @@ Half-normal hyperpriors on the four $\sigma$'s. Partial pooling shrinks low-volu
 - Parameter count is a few thousand (shooters dominate) — fast once the offset does the heavy lifting.
 
 **Files:**
-- `src/models/stochastic/xg_hierarchical.py` — model definition.
+- `src/models/stochastic/xg_layer.py` — model definition (renamed from the planned xg_hierarchical.py, too close to hierarchical_xg.py, Track B v1.1).
 - `src/pipelines/fit_xg_layer.py` — load `shot_xg` + IDs, fit, save `output/posteriors/xg_layer_<season>.nc`.
 - Adjusted per-shot xG (posterior mean and sd) written to a `shot_xg_v2` table; `shot_xg` stays untouched.
 
@@ -1159,7 +1216,58 @@ Half-normal hyperpriors on the four $\sigma$'s. Partial pooling shrinks low-volu
 
 **Goalie handoff (resolved).** Track B has no estimated goalie term; it takes goalie offsets as fixed inputs from Phase 3. To use the v2.1 goalie effect, swap it in as that input: one $\gamma$ posterior draw per Track B posterior draw, which also carries the goalie uncertainty Track B v1 ignores. Goalie skill still enters only once.
 
-### v2.2 — Lineup (Player-Level) Model
+### v2.2 — Lineup (Player-Level) Model — DONE (live model since 2026-11-08)
+
+**Data fixes first.**
+- `scripts/check_shifts.py` — per season: games with shift charts, skater shift time vs box-score TOI, dressed-skater match, on-ice skater counts, goalie gaps; the worst games. It found 2025-26 missing 505 of 1,312 shift charts.
+- Cause: `load_all` swallowed shift-request failures (`except: shift_count = 0`) and never retried, because the game counted as loaded. Fixed in `scripts/load_all.py`: failures are logged; `shift_fetch_log` records every try; every run retries games without a chart (failures each run, empty answers after `EMPTY_RETRY_DAYS` = 1, since an empty answer can be a fluke); `--shifts-only` runs just that; progress every 10 games.
+- `src/data/nhl_api.py`: every request has a 30 s timeout (a stalled request used to hang forever, silently), and `call()` retries timeouts and connection errors; shift rows with no player are skipped instead of failing the whole game; goal markers (typeCode 505) are dropped.
+- Result: all 527 retried games filled. Only 57 games (2024-25) genuinely have no chart in the NHL feed, under 1% of games, skipped. A few games store every shift twice; the stint builder de-duplicates.
+- Windows note: several hung `load_all` runs at once kept the database locked; `Stop-Process -Name python -Force` clears them.
+
+**Stints** (`src/processing/stints.py`, `src/pipelines/build_stints.py`; tables `stints`, `stint_games`). Stretches with no line change: skaters and goalie per side, strength, score at start, faceoff zone start (home point of view), shots, xG and goals per side. Conventions: a shot or goal at second t goes to the stint with s < t ≤ e (the scorer whose shift ends at the goal gets it); a faceoff at t sets the zone of the stint starting at t; duplicate shift rows and goal markers dropped. A game is skipped if TOI is off by more than 3%, the skater count is outside 3–6 for more than 1% of the time, there's no goalie for more than 6% of the time, or shots fall outside any stint. Checked on a hand-worked game (exact match). Real build: 6,669 games ok, 60 skipped (under 1%), 2.5M stints, 2.2M at 5v5; 48.6 min of 5v5 and 9.2 min of special teams per game, 5v5 xG 27,501 vs goals 27,288.
+
+**Ridge RAPM reference** (`src/models/deterministic/rapm.py`, `src/pipelines/fit_rapm.py`). 5v5 stints with both goalies, two rows per stint (each team on offense), target xG/60 weighted by minutes; player offense and defense columns; controls for home, score state, zone start; players under 100 min share "other" columns. Ridge from the normal equations (matches scikit-learn's `Ridge` to 3e-7); lambda by 5-fold cross-validation grouped by game. Real fit (2 seasons, 891k stints): lambda 1,000 (interior), players cut held-out error 0.18% vs controls only (stint xG is mostly noise). Controls are textbook: home +0.13, trailing +0.12 / +0.21, leading −0.09 / −0.14, offensive-zone faceoff +0.67, defensive-zone −0.90, call-ups' offense −0.35. MacKinnon tops offense; Seider, Pelech, Tanev and Slavin top defense; system players (Spence, Hagel) high, as usual for RAPM.
+
+**Bayesian RAPM** (`src/models/stochastic/lineup_rapm.py`, `src/pipelines/fit_lineup_rapm.py`). The same regression with spreads for forward/defense × offense/defense learned by maximizing the exact marginal likelihood (a Gaussian likelihood with Gaussian priors gives an exact Gaussian posterior: no MCMC). Synthetic recovery: all four spreads recovered, 91–92% interval coverage. Real fit: spreads F off 0.206, D off 0.177, F def 0.184, D def 0.172 (ridge's lambda implied one spread of 0.132, so ridge over-shrinks); agreement with ridge 0.99; held-out error the same as ridge. Team-season "system" effects (`--teams`) can't be separated from the roster (posterior sds 75–85% of their spread, no held-out gain), so they're dropped.
+
+**Into the game model** (`src/processing/lineup_context.py`, `src/pipelines/build_lineup_asof.py`; tables `player_rating_asof`, `lineup_fits`, `lineup_context`).
+- The Bayesian RAPM is refit every 14 days on the 730 days of stints before that date.
+- Each game's dressed skaters are weighted by expected TOI (average of their previous 10 games), and the lineup's strength is compared with the team's usual lineup (previous 20 games, rated with the same ratings). Unrated players get the "other" rating.
+- `lin` = (change in offense − opponent's change in defense) × 5v5 share of xG / league 5v5 xG/60, entered in Track B as `kappa_lineup × lin` on the log xG rate (κ ~ N(1, 0.5), learned). `--lineup` in `fit_hierarchical` / `backtest_season`, label `_r_lu`.
+- Tests: a planted scratch of a team's top forward matched the hand-computed change exactly; κ recovered (0.96 for a true 1, −0.05 for a true 0); no leakage.
+- The weakest real lineups are the last week of 2025-26 (teams resting regulars, 3–5 call-ups) and opening weeks. Typical change ±3.6% xG, the weakest −20%.
+- Limit: linemates who always play together can't be separated, so the shift is strongest for players the model can isolate.
+
+**Backtest** (`scripts/compare_vs_live.py`: variants vs the live model on shared games, per season and pooled). With ratings rebuilt from 2022-10 (a first test had lineup shifts only from 2024-10, so most training games had none) and 2023-24 added:
+
+| vs live (v2.0 + rest) | 2023-24 | 2024-25 | 2025-26 | Pooled (3,936 games) |
+|---|---|---|---|---|
+| + lineup (`_r_lu`) | −0.0011 | −0.0017 | +0.0002 | **−0.0009 [−0.0020, +0.0002]** |
+| + rest on finishing (`_rg`) | +0.0002 | −0.0008 | −0.0000 | −0.0002 [−0.0007, +0.0003] |
+
+**Decision: adopted (2026-11-08), a deliberate exception to the "whole range below 0" rule.** Within luck by that rule, but about 94% likely better, and it grew (−0.0006 → −0.0009) rather than faded with more data; the downside if it is luck is at most about +0.0002. The backtest uses the actual dressed lineup (the best case); live lineups come from the feeds below. Rest on finishing shrank toward 0 with the third season (−0.0004 → −0.0002): closed. Recheck with 2026-27 complete (checklist below); if it is then clearly worse, go back to `--no-lineup`.
+
+**Live lineups** (`src/data/lineup_sources.py`, `src/processing/live_lineup.py`, in `predict_day` whenever the active fit has the lineup term). Sources, checked with `scripts/probe_lineup_sources.py`:
+- **ESPN injuries** (unofficial public feed, no key): all 32 teams, statuses Injured Reserve / Out / Day-To-Day, names and positions. Abbreviations match the NHL's except LA, NJ, SJ, TB.
+- **NHL game-day roster** (`gamecenter/<id>/play-by-play` → `rosterSpots`): on game day about 23 per team, the active roster *without* injured-reserve players but with healthy scratches and Out / day-to-day players.
+
+Assumed lineup per team:
+1. If the NHL roster already lists 18 or fewer skaters, that is the dressed lineup; use it ("posted").
+2. Otherwise, start from the last dressed lineup; drop players not on today's roster or listed Out; keep day-to-day players, noted (`--dtd-out` drops them); bring back regulars who are on the roster, healthy and dressed for 10+ of the last 20 games.
+3. Apply `--out TEAM=NAME` / `--in TEAM=NAME`.
+4. Balance to 12 F / 6 D: drop the least-used extras, fill from the roster by usage, or with an unrated call-up (the fit's "other player" rating).
+
+The shift uses the same calculation as the backtest (expected TOI from the previous 10 games, vs the team's previous 20 lineups, the latest rating fit). Each game prints the lineup source, notes and the xG shift; the log keeps `lineup_source_*`, `lineup_notes_*`, `lineup_players_*`, `d_off_*`, `lin_*`, `lineup_fit`. Tested on each case (Out player, off the roster, returning regular, posted lineup, both feeds down, day-to-day, overrides) and end to end. `fit_hierarchical` turns `--lineup` on by default for v2.0 and stops if stints or ratings are behind; weekly: `build_stints`, `build_lineup_asof` before the fit (DAILY_RUN.md).
+
+**Recheck checklist (spring 2027):**
+1. `py -m src.pipelines.build_stints`
+2. `py -m src.pipelines.build_lineup_asof --rebuild --start 2022-10-01`
+3. Backtest 2026-27 with `--rest` and with `--rest --lineup`; rerun the earlier `--rest --lineup` seasons with `--restart` so they use the newest ratings.
+4. `py .\scripts\check_backtests.py`, then `py .\scripts\compare_vs_live.py --variants trackbtv_w730_r_lu` (about 5,200 games).
+5. Pooled range entirely below 0: confirmed. Clearly above 0: switch back with `--no-lineup`. Otherwise keep it. The forward test (`score_forward`) adds live evidence against the market.
+
+#### Original plan
 
 **Idea.** The v1 game model rates *teams*. It can't tell when a top player is injured, scratched or traded. The lineup model rates each *skater's* effect on xG for and against, then builds tonight's team strength from tonight's dressed lineup. It is essentially Bayesian RAPM, fit with the same hierarchical/NUTS machinery as Track B.
 
@@ -1219,6 +1327,55 @@ and the mirror image for the away side. Each skater gets an offensive effect $o_
 **Validation.** Same Phase 7 walk-forward harness as the team model: game log loss and Brier, overall and on the lineup-change subset. Plus synthetic recovery on simulated stints with known player effects. If the lineup model only wins on lineup-change games, consider a cheaper hybrid: the team model adjusted for known missing players.
 
 **Files.** `src/processing/stints.py`, `src/models/stochastic/lineup_rapm.py`, `src/pipelines/fit_lineup.py`, posteriors to `output/posteriors/lineup_<window>.nc`.
+
+### v2.4 — Playoff Odds — DONE (2026-11-08)
+
+**Files:** `src/models/stochastic/season_sim.py` (`current_standings`, `simulate_season`, `qualify`, `summarize`), `src/pipelines/playoff_odds.py` (`py -m src.pipelines.playoff_odds [--sims 20000] [--date …] [--no-drift] [--no-check]`).
+
+**Method:**
+- **One posterior draw per simulated season,** used for every remaining game, so a team better than its average rating is better all season.
+- **Weekly rating drift:** each team's offense and defense random-walk at the fit's own τ_off / τ_def, zero-sum.
+- **Exact game outcomes:** regulation, OT and shootout for either side, from `outcome_probs`. Rest and back-to-back shifts from the schedule; each team's goalie offset is its goalies' Phase 3 γ weighted by the share of the last 20 starts; lineups at full strength.
+- **NHL rules:** win 2, OT/SO loss 1; ties broken by points, RW, ROW, wins, then a coin flip (head-to-head and goal differential not simulated). Top 3 per division plus 2 wild cards per conference.
+- **Standings** come from the database and are checked against the NHL standings feed.
+
+**Tests** (synthetic 32-team league, balanced 82-game schedule):
+- equal teams 43–56% to make the playoffs (about 50%) and 10–16% to win the division (12.5%);
+- a +0.45 team 99.9%, a −0.45 team 0.1%;
+- exactly 16 playoff teams and 4 division winners in every season;
+- 2.23 points per game; about ±15 points of luck over a season;
+- drift widens the ranges; a team 30 points clear with few games left is 100%.
+
+**Output:** printed per division, saved as `output/playoffs/playoff_odds_<date>.csv`, and appended to `playoff_odds_history_<season>.csv` for charts. First real run (2026-11-08, 276 games played): the standings matched the NHL's for all 32 teams.
+
+**Open:**
+- Stanley Cup / round-by-round odds (bracket simulation, best-of-7, playoff OT without shootouts).
+- A historical check: run as of past dates with fits ending then, and score P(playoffs) against what happened.
+
+### v2.5 — Visuals for v2 — IN PROGRESS
+Order: (1) pregame card upgrade, (2) playoff odds chart, (3) team card, (4) player card.
+
+**(1) Pregame card — DONE (2026-11-08).** `src/viz/pregame_card.py`, `src/viz/card_style.py`,
+`src/pipelines/make_cards.py`. A new band under the header shows, per team, what the model knew:
+- playoff odds from the latest `output/playoffs/playoff_odds_<date>.csv` on or before the game
+  date (points, games played, projected points with 90% range; the run date if older);
+- schedule chips: days off / back-to-back (with km overnight) / 3rd game in 4 nights / goalie
+  also started last night (tiring spots in orange);
+- lineup: source (NHL posted or assumed), xG change vs the usual lineup (`expm1(lin)`), and the
+  live_lineup notes grouped (Out, Back, Fills in, Scratched, Day-to-day playing).
+Old log rows without these columns are drawn as the v1 card. The rest of the card is unchanged
+(the 90% win-probability range was already there). No change to `predict_day`; redraw any
+logged game with `py -m src.pipelines.make_cards pregame <game_id>`.
+
+**(2) Playoff odds charts — DONE (2026-11-08).** `src/viz/playoff_chart.py`,
+`src/pipelines/make_playoff_charts.py`; `playoff_odds` draws them at the end (`--no-charts` to skip).
+- `playoff_board_<date>.png`: four division panels; per team one bar = P(playoffs), split by how
+  it gets in (division win in the team colour, 2nd/3rd lighter, wild card lightest), points now
+  and projected points (90% range).
+- `playoff_trend_<season>.png`: P(playoffs) per team by run date, one panel per division,
+  labelled at the line ends. Grows with each weekly run.
+Team colours: a team whose colour is too close to a division rival's switches to its next team
+colour; if none works its line is dashed. Labels always name the team.
 
 ### v2.3 — Other Candidate Improvements
 
@@ -1451,6 +1608,16 @@ Decided during v2.0:
 - **Past games use the ratings of their date** in late_game and score_state.
 - **Live fits use 2,000 draws** (`--draws 2000`); backtests keep 1,000.
 
+Decided during v2.2:
+
+- **Calibration: leave the model as is** (`scripts/check_calibration.py`, live model, 3,936 games): pooled slope 1.085 [0.96, 1.23], home bias +0.026 [−0.032, +0.079], both consistent with calibrated. Per-season slopes swing (1.16, 1.20, 0.83), and a walk-forward recalibration (fit on earlier seasons, apply to the next) helped 2024-25 (−0.0019) but clearly hurt 2025-26 (+0.0037); pooled +0.0009 [−0.0006, +0.0025]. The 1.07–1.08 seen across variants was noise.
+
+- **Lineup model adopted (live from 2026-11-08):** −0.0009 [−0.0020, +0.0002] over 3,936 games, about 94% likely better. Adopted knowingly despite the range crossing 0; recheck with 2026-27 (checklist in the v2.2 section).
+- **Live lineups:** ESPN injuries + the NHL game-day roster, with `--out` / `--in` / `--dtd-out`; see the v2.2 section.
+- **Rest on finishing closed:** shrank to −0.0002 with a third season.
+- **Shift charts:** `load_all` retries missing charts every run; 57 genuinely missing games are skipped.
+- **Team system effects dropped:** they can't be separated from the roster.
+
 Decided during v2.0b / v2.0d:
 
 - **Live model: v2.0 + back-to-back effects.** `--rest` is the default for `--model tv`; `--no-rest` gives plain v2.0.
@@ -1458,6 +1625,8 @@ Decided during v2.0b / v2.0d:
 - **ARI → UTA is one franchise** in the game table.
 - **Guessed starters are fine:** a wrong guess costs about 0.0001 log loss; `--goalie` stays optional.
 - **Rest enters through shot quality first;** rest on finishing/goaltending is tested separately before adding it.
+- **v2.0e (rest on finishing) and v2.0f (travel) not adopted:** within luck / no gain vs v2.0 + rest. Both stay in the code (`--rest-goals`, `--travel`); v2.0e is the one to retest with more data.
+- **Backtest runs:** one season per window, never the same season twice (two runs on one file duplicate games); check with `scripts/check_backtests.py`.
 
 ---
 

@@ -47,8 +47,9 @@ from src.processing.goalie import goalie_game_xg
 from src.processing.late_game import load_params
 from src.models.active_fit import read_active, active_fit_path, check_params_match
 from src.models.game_model import load_track_b, default_starter, predict_matchup
-from src.models.stochastic.hierarchical_tv import rest_shift
-from src.processing.game_table import rest_on_date
+from src.models.stochastic.hierarchical_tv import context_shift
+from src.processing.schedule_context import context_for_game, CONTEXT_COLS
+from src.processing.game_table import goalie_rest_on_date, layer_rating
 from src.models.stochastic.goalie import goalie_rating_as_of
 from src.models.stochastic.montecarlo import simulate_matchup_score_state
 from src.analysis.aggregation import fair_american_odds
@@ -122,7 +123,8 @@ def print_goalies(conn, teams_wanted) -> None:
         print(g.to_string(index=False) if len(g) else "  none found")
 
 
-def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims, seed) -> dict:
+def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims, seed,
+                goalie_layer: bool = False, lineup_ctx: dict | None = None) -> dict:
     home, away, day = row["home"], row["away"], row["game_date"]
     picks, sources = {}, {}
     for side, team in (("home", home), ("away", away)):
@@ -132,13 +134,21 @@ def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims,
             picks[side], sources[side] = default_starter(conn, team, day), "default"
     gamma = {}
     for side, gid in picks.items():
+        if goalie_layer:                            # v2.1: xG-layer rating as of the game date
+            gamma[side] = layer_rating(conn, gid, day)
+            continue
         r = ratings[ratings["goalie_id"] == gid] if gid is not None else ratings.iloc[0:0]
         gamma[side] = float(-np.log(r["theta_mean"].iloc[0])) if len(r) else 0.0
 
-    # Back-to-backs (v2.0d fits with rest terms; a zero shift otherwise), through the offsets
-    rest_h, rest_a = rest_on_date(conn, home, day), rest_on_date(conn, away, day)
-    b2b_h, b2b_a = int(rest_h == 1), int(rest_a == 1)
-    sh, sa = rest_shift(draws, [b2b_h], [b2b_a])
+    # Schedule context: rest, back-to-backs, travel (zero shift for terms the fit lacks), through the offsets
+    ctx = context_for_game(conn, row["game_id"])
+    # v2.2 lineup term: tonight's assumed lineups (live_lineup.py) when the fit has one; else full strength
+    ctx["lin_home"] = float(lineup_ctx["lin_home"]) if lineup_ctx else 0.0
+    ctx["lin_away"] = float(lineup_ctx["lin_away"]) if lineup_ctx else 0.0
+    for side in ("home", "away"):                   # v2.0g: the chosen starter also started yesterday?
+        gr = goalie_rest_on_date(conn, picks[side], day)
+        ctx[f"grest_{side}"], ctx[f"g2b_{side}"] = gr, int(gr == 1)
+    sh, sa = context_shift(draws, {c: [v] for c, v in ctx.items()})
     g_home_eff, g_away_eff = gamma["home"] - float(sa[0]), gamma["away"] - float(sh[0])
 
     res = predict_matchup(draws, teams, late, home, away, g_home_eff, g_away_eff)
@@ -153,7 +163,7 @@ def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims,
         "home_goalie": picks["home"], "away_goalie": picks["away"],
         "home_goalie_source": sources["home"], "away_goalie_source": sources["away"],
         "gamma_home": gamma["home"], "gamma_away": gamma["away"],
-        "rest_home": rest_h, "rest_away": rest_a, "b2b_home": b2b_h, "b2b_away": b2b_a,
+        **ctx,
         "gamma_home_eff": g_home_eff, "gamma_away_eff": g_away_eff,
         "p_home": s["home_win"]["mean"], "p_home_lo": s["home_win"]["lo"], "p_home_hi": s["home_win"]["hi"],
         "p_reg_home": s["reg_home"]["mean"], "p_reg_away": s["reg_away"]["mean"], "p_tie_reg": s["tie_reg"]["mean"],
@@ -182,6 +192,14 @@ def main():
                         help="re-predict games already in the log (e.g. after starters are confirmed)")
     parser.add_argument("--score-sims", type=int, default=50_000, help="score-state simulations per game")
     parser.add_argument("--no-cards", action="store_true", help="don't draw pregame cards")
+    parser.add_argument("--out", action="append", metavar="TEAM=NAME", default=[],
+                        help="lineup fits: a skater who will not play (last name or id); repeatable")
+    parser.add_argument("--in", dest="ins", action="append", metavar="TEAM=NAME", default=[],
+                        help="lineup fits: a skater who will play (last name or id); repeatable")
+    parser.add_argument("--dtd-out", action="store_true", help="lineup fits: treat day-to-day players as out")
+    parser.add_argument("--show-lineups", action="store_true",
+                        help="lineup fits: print every team's full assumed lineup (forwards, defense) by name")
+    parser.add_argument("--no-injuries", action="store_true", help="lineup fits: don't use the ESPN injury list")
     parser.add_argument("--list-goalies", nargs="+", metavar="TEAM",
                         help="print these teams' goalies with their ids, then stop")
     args = parser.parse_args()
@@ -216,6 +234,23 @@ def main():
         print(f"Starter given: {team} {name or 'unknown name'} ({gid})")
     gg = goalie_game_xg(conn)
     done = played_ids(conn)
+    use_lineup = bool(active.get("lineup", False))
+    if use_lineup:                                   # v2.2: live lineups (ESPN injuries + NHL game-day roster)
+        from src.data import lineup_sources as lsrc
+        from src.processing import live_lineup as ll
+        lhist = ll.history(conn)
+        injuries = None
+        if not args.no_injuries:
+            try:
+                injuries = lsrc.fetch_injuries()
+                print(f"Injury list (ESPN): {len(injuries)} players, {injuries['status'].value_counts().to_dict()}")
+            except Exception as e:                   # noqa: BLE001
+                print(f"Injury list unavailable ({type(e).__name__}): lineups use the NHL roster and --out only")
+        overrides = {"out": {}, "in": {}}
+        for kind, items in (("out", args.out), ("in", args.ins)):
+            for it in items:
+                t, _, who = it.partition("=")
+                overrides[kind].setdefault(t.strip().upper(), []).append(who.strip())
     made_at = datetime.now().isoformat(timespec="seconds")
     FORWARD_DIR.mkdir(parents=True, exist_ok=True)
     total_new = 0
@@ -251,21 +286,64 @@ def main():
             if g["home"] not in teams or g["away"] not in teams:
                 print(f"{tag}  skipped: team not in the fit")
                 continue
+            lctx, lnotes = None, {}
+            if use_lineup:
+                try:
+                    spots, state = lsrc.fetch_roster_spots(g["game_id"])
+                except Exception as e:               # noqa: BLE001
+                    spots, state = None, None
+                    print(f"{tag}  NHL game-day roster unavailable ({type(e).__name__}): last lineups, injuries, --out")
+                lus = {side: ll.assume_lineup(team, day, lhist, spots, injuries,
+                                              outs=overrides["out"].get(team, []), ins=overrides["in"].get(team, []),
+                                              dtd_out=args.dtd_out)
+                       for side, team in (("home", g["home"]), ("away", g["away"]))}
+                lctx = ll.lineup_shift(conn, lhist, g["home"], g["away"], day, lus)
+                lnotes = {side: lus[side] for side in lus}
             r, res, sims = predict_one(g, draws, teams, late, ss, ratings, conn, goalies, args.score_sims,
-                                       seed=int(g["game_id"]) % 2**31)
+                                       seed=int(g["game_id"]) % 2**31,
+                                       goalie_layer=bool(active.get("goalie_layer", False)), lineup_ctx=lctx)
+            if use_lineup:
+                for side in ("home", "away"):
+                    r[f"lineup_source_{side}"] = lnotes[side]["source"]
+                    r[f"lineup_notes_{side}"] = "; ".join(lnotes[side]["notes"])
+                    r[f"lineup_players_{side}"] = ",".join(map(str, lnotes[side]["players"]))
+                    r[f"d_off_{side}"], r[f"d_def_{side}"] = lctx[f"d_off_{side}"], lctx[f"d_def_{side}"]
+                r["lineup_fit"] = lctx["lineup_fit"]
             r.update({"predicted_at": made_at, "fit_file": fit_path.name, "model": active["label"]})
             rows.append(r)
             for_cards.append((r, res, sims))
             gs = "" if r["home_goalie_source"] == r["away_goalie_source"] == "default" else "  [starters given]"
-            gs += "".join(f"  [{t} back-to-back]" for t, b in ((g["home"], r["b2b_home"]), (g["away"], r["b2b_away"])) if b)
+            for t, sd in ((g["home"], "home"), (g["away"], "away")):
+                notes = (["back-to-back" + (f", {r[f'km_{sd}']:,.0f} km overnight" if r[f"km_{sd}"] >= 100 else "")]
+                         if r[f"b2b_{sd}"] else []) + (["3 in 4 nights"] if r[f"dense_{sd}"] else []) \
+                    + (["goalie also started last night"] if r[f"g2b_{sd}"] else [])
+                gs += f"  [{t} {'; '.join(notes)}]" if notes else ""
             print(f"{tag}  {g['home']} {r['p_home']:.1%} ({r['p_home_lo']:.0%}-{r['p_home_hi']:.0%})  "
                   f"fair {r['fair_home']} / {r['fair_away']}   total {r['exp_total']:.2f}, "
                   f"{g['home']} -1.5 {r['p_home_m1_5']:.1%}{gs}")
+            if use_lineup:
+                for t, sd in ((g["home"], "home"), (g["away"], "away")):
+                    nts = lnotes[sd]["notes"]
+                    print(f"      {t} lineup ({lnotes[sd]['source']}, xG shift {np.expm1(r[f'lin_{sd}']):+.1%}): "
+                          + ("; ".join(nts) if nts else "same as last game"))
+                    if args.show_lineups:
+                        lu = lnotes[sd]
+                        fw = [ll._label(lhist, p) for p, ps in zip(lu["players"], lu["positions"]) if ps != "D"]
+                        dm = [ll._label(lhist, p) for p, ps in zip(lu["players"], lu["positions"]) if ps == "D"]
+                        print(f"          F ({len(fw)}): {', '.join(fw)}")
+                        print(f"          D ({len(dm)}): {', '.join(dm)}")
         if rows:
             df = pd.DataFrame(rows)
-            if log_path.exists():                                   # keep the file's column order
-                df = df.reindex(columns=pd.read_csv(log_path, nrows=0).columns)
-            df.to_csv(log_path, mode="a", index=False, header=not log_path.exists())
+            old_cols = list(pd.read_csv(log_path, nrows=0).columns) if log_path.exists() else []
+            if old_cols and not set(df.columns) <= set(old_cols):
+                # new columns (e.g. travel context): rewrite the log with them; older rows get blanks
+                old = pd.read_csv(log_path)
+                pd.concat([old, df], ignore_index=True)[old_cols + [c for c in df.columns if c not in old_cols]] \
+                    .to_csv(log_path, index=False)
+            else:
+                if old_cols:                                        # keep the file's column order
+                    df = df.reindex(columns=old_cols)
+                df.to_csv(log_path, mode="a", index=False, header=not old_cols)
             total_new += len(rows)
         if for_cards and not args.no_cards:                         # after logging, so a card error can't lose rows
             from src.pipelines.make_cards import pregame_card

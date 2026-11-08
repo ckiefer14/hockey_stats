@@ -56,6 +56,21 @@ TAU_LEAGUE_SUMMER_PRIOR = 0.05
 REST_PRIOR_SD = 0.1           # back-to-back effects on the log scoring rate (v2.0d)
 TAU_HOME_SUMMER_PRIOR = 0.05  # season-to-season change in home ice (v2.0d, home_drift)
 REST_VARS = ["rest_off_home", "rest_def_home", "rest_off_away", "rest_def_away"]
+# v2.0e: back-to-back effects on goals per xG (finishing of the tired team, its goalie)
+REST_GOAL_VARS = ["rest_fin_home", "rest_gk_home", "rest_fin_away", "rest_gk_away"]
+# v2.0f: schedule context on shot quality, same for home and away teams (schedule_context.py):
+# trav = overnight travel (1000s of km), tz = time zones crossed, dense = 3rd game in 4 nights
+TRAVEL_FEATURES = ["trav", "tz", "dense"]
+TRAVEL_VARS = [f"{f}_{k}" for f in TRAVEL_FEATURES for k in ("off", "def")]
+# v2.0g: a starting goalie on zero rest (also started yesterday) lets in more of the same
+# shots: one effect on the opponent's goals per xG, shared by home and road goalies
+GOALIE_REST_VARS = ["gk_b2b"]
+# v2.2: lineup strength vs the team's usual lineup (lineup_context.py), a known log xG-rate
+# shift lin_home / lin_away scaled by a learned kappa (1 = take the player ratings at face value)
+LINEUP_VARS = ["kappa_lineup"]
+KAPPA_PRIOR = (1.0, 0.5)
+GK_B2B_PRIOR_SD = 0.15
+ALL_REST_VARS = REST_VARS + REST_GOAL_VARS + TRAVEL_VARS + GOALIE_REST_VARS + LINEUP_VARS
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +129,26 @@ def _walk(name: str, start, tau, tau_summer, scale_in, is_summer, shape_extra=No
 # ---------------------------------------------------------------------------
 
 def build_model_tv(gt: pd.DataFrame, teams: list[str], step_days: int = STEP_DAYS,
-                   rest: bool = False, home_drift: bool = False) -> tuple[pm.Model, dict]:
+                   rest: bool = False, home_drift: bool = False,
+                   rest_goals: bool = False, travel: bool = False,
+                   goalie_rest: bool = False, lineup: bool = False) -> tuple[pm.Model, dict]:
     """Track B v2.0 for the games in gt. Returns (model, grid).
 
     rest (v2.0d): back-to-back effects. A team on the second night of a back-to-back
         generates rest_off_* less shot quality (log scale) and allows rest_def_* more;
         separate values for a tired home team and a tired road team. Needs b2b_home /
         b2b_away in gt (build_game_table adds them).
+    rest_goals (v2.0e): back-to-back effects on goals per xG. A tired team converts its
+        chances rest_fin_* worse and its goalie (often a backup or tired starter) lets in
+        rest_gk_* more of the same shots. These move goals without moving xG.
+    travel (v2.0f): schedule context on shot quality. For each feature f in TRAVEL_FEATURES,
+        a team with value x creates f_off * x less xG (log scale) and allows f_def * x more.
+        Shared by home and road teams (the b2b terms already carry the side difference).
+        Needs <f>_home / <f>_away in gt (build_game_table adds them).
+    lineup (v2.2): log_nu += kappa_lineup * lin_<side> (lineup strength vs usual; needs
+        lin_home / lin_away in gt, from build_game_table(..., lineup=True)).
+    goalie_rest (v2.0g): gk_b2b, the log change in the opponent's goals per xG when the
+        starting goalie also started yesterday. Needs g2b_home / g2b_away in gt.
     home_drift (v2.0d): home ice changes from season to season (a random walk that steps
         only across off-seasons) instead of one value for the whole window.
     """
@@ -136,8 +164,14 @@ def build_model_tv(gt: pd.DataFrame, teams: list[str], step_days: int = STEP_DAY
     xg_a = np.maximum(gt[XG_COLS[1]].to_numpy(float), XG_FLOOR)
     y_h, y_a = gt[GOAL_COLS[0]].to_numpy(), gt[GOAL_COLS[1]].to_numpy()
     tied = (y_h == y_a).astype(float)
-    if rest:
+    if rest or rest_goals:
         b2b_h, b2b_a = gt["b2b_home"].to_numpy(float), gt["b2b_away"].to_numpy(float)
+    if goalie_rest:
+        g2b_h, g2b_a = gt["g2b_home"].to_numpy(float), gt["g2b_away"].to_numpy(float)
+    if lineup:
+        lin_h, lin_a = gt["lin_home"].to_numpy(float), gt["lin_away"].to_numpy(float)
+    if travel:
+        ctx = {f"{f}_{sd}": gt[f"{f}_{sd}"].to_numpy(float) for f in TRAVEL_FEATURES for sd in ("home", "away")}
 
     with pm.Model(coords=coords) as model:
         # 1. Random-walk step sizes
@@ -199,6 +233,16 @@ def build_model_tv(gt: pd.DataFrame, teams: list[str], step_days: int = STEP_DAY
             r_def_a = pm.Normal("rest_def_away", 0.0, REST_PRIOR_SD)
             log_nu_h = log_nu_h - r_off_h * b2b_h + r_def_a * b2b_a
             log_nu_a = log_nu_a - r_off_a * b2b_a + r_def_h * b2b_h
+        if lineup:                                       # who dressed tonight vs the usual lineup
+            kap = pm.Normal("kappa_lineup", *KAPPA_PRIOR)
+            log_nu_h = log_nu_h + kap * lin_h
+            log_nu_a = log_nu_a + kap * lin_a
+        if travel:                                       # travel, jet lag, crowded stretches
+            for f in TRAVEL_FEATURES:
+                e_off = pm.Normal(f"{f}_off", 0.0, REST_PRIOR_SD)
+                e_def = pm.Normal(f"{f}_def", 0.0, REST_PRIOR_SD)
+                log_nu_h = log_nu_h - e_off * ctx[f"{f}_home"] + e_def * ctx[f"{f}_away"]
+                log_nu_a = log_nu_a - e_off * ctx[f"{f}_away"] + e_def * ctx[f"{f}_home"]
 
         def gamma_logp(x, log_nu):
             return (kappa * (log_kappa - log_nu) - pt.gammaln(kappa)
@@ -208,6 +252,17 @@ def build_model_tv(gt: pd.DataFrame, teams: list[str], step_days: int = STEP_DAY
         # 6. Goals likelihood: tie-inflated Poisson, as v1.1
         log_lam_h = log_nu_h + delta0[k] + delta_home + phi_off[hi] - phi_def[ai] - g_away
         log_lam_a = log_nu_a + delta0[k] + phi_off[ai] - phi_def[hi] - g_home
+        if rest_goals:                                   # tired team: finishes worse, goalie leaks
+            f_h = pm.Normal("rest_fin_home", 0.0, REST_PRIOR_SD)
+            k_h = pm.Normal("rest_gk_home", 0.0, REST_PRIOR_SD)
+            f_a = pm.Normal("rest_fin_away", 0.0, REST_PRIOR_SD)
+            k_a = pm.Normal("rest_gk_away", 0.0, REST_PRIOR_SD)
+            log_lam_h = log_lam_h - f_h * b2b_h + k_a * b2b_a
+            log_lam_a = log_lam_a - f_a * b2b_a + k_h * b2b_h
+        if goalie_rest:                                  # tired goalie: more goals from the same xG
+            gk = pm.Normal("gk_b2b", 0.0, GK_B2B_PRIOR_SD)
+            log_lam_h = log_lam_h + gk * g2b_a
+            log_lam_a = log_lam_a + gk * g2b_h
         lam_h, lam_a = pm.math.exp(log_lam_h), pm.math.exp(log_lam_a)
         tau = pm.Normal("tau", 0.0, TIE_PRIOR_SD)
         rho = pm.Deterministic("rho", pm.math.exp(tau) - 1.0)
@@ -231,7 +286,7 @@ KEEP_VARS = ["tau_off", "tau_def", "tau_off_summer", "tau_def_summer", "tau_beta
              "tau_beta0_summer", "tau_delta0_summer", "beta0_init", "delta0_init", "beta_home", "delta_home",
              "log_kappa", "kappa", "sigma_off", "sigma_def", "sigma_phi_off", "sigma_phi_def", "tau", "rho",
              "alpha_home", "phi_off", "phi_def", "beta0_path", "delta0_path", "xg_mu_off_path", "xg_mu_def_path",
-             "tau_home_summer", "beta_home_path"] + REST_VARS
+             "tau_home_summer", "beta_home_path"] + ALL_REST_VARS
 
 
 TARGET_ACCEPT_TV = 0.95      # random-walk steps near tau = 0 need smaller NUTS steps than v1.1 (0.9)
@@ -329,12 +384,56 @@ def add_paths(draws: dict, post) -> dict:
     """Add pooled path draws (and step_days) to a draws dict, if the fit has them."""
     if not is_time_varying(post):
         return draws
-    for name in PATH_VARS + ["beta_home_path", "delta_home"] + REST_VARS:
+    for name in PATH_VARS + ["beta_home_path", "delta_home"] + ALL_REST_VARS:
         if name in post:
             x = post[name].values
             draws[name] = x.reshape(-1, *x.shape[2:])
     draws["step_days"] = int(post.attrs.get("step_days", STEP_DAYS))
     return draws
+
+
+def _shift(m: dict, x: dict):
+    """Log scoring-rate shifts (home, away) from the schedule context.
+
+    m: effect values (floats or per-draw arrays) for the terms the fit has; x: context arrays
+    b2b_home, b2b_away and, for v2.0f, <f>_home / <f>_away for f in TRAVEL_FEATURES.
+    Shot-quality terms (v2.0d, v2.0f) and goals-per-xG terms (v2.0e) add on the log scale."""
+    b2b_h, b2b_a = np.asarray(x["b2b_home"], float), np.asarray(x["b2b_away"], float)
+    sh, sa = 0.0 * b2b_h, 0.0 * b2b_a
+    if "rest_off_home" in m:
+        sh = sh - m["rest_off_home"] * b2b_h + m["rest_def_away"] * b2b_a
+        sa = sa - m["rest_off_away"] * b2b_a + m["rest_def_home"] * b2b_h
+    if "rest_fin_home" in m:
+        sh = sh - m["rest_fin_home"] * b2b_h + m["rest_gk_away"] * b2b_a
+        sa = sa - m["rest_fin_away"] * b2b_a + m["rest_gk_home"] * b2b_h
+    if "kappa_lineup" in m:
+        sh = sh + m["kappa_lineup"] * np.asarray(x["lin_home"], float)
+        sa = sa + m["kappa_lineup"] * np.asarray(x["lin_away"], float)
+    if "gk_b2b" in m:
+        sh = sh + m["gk_b2b"] * np.asarray(x["g2b_away"], float)
+        sa = sa + m["gk_b2b"] * np.asarray(x["g2b_home"], float)
+    if "trav_off" in m:
+        for f in TRAVEL_FEATURES:
+            fh, fa = np.asarray(x[f"{f}_home"], float), np.asarray(x[f"{f}_away"], float)
+            sh = sh - m[f"{f}_off"] * fh + m[f"{f}_def"] * fa
+            sa = sa - m[f"{f}_off"] * fa + m[f"{f}_def"] * fh
+    return sh, sa
+
+
+def context_shift(draws: dict, x) -> tuple:
+    """Log-rate shifts (home, away) for games with schedule context x (a DataFrame or dict
+    with b2b_home / b2b_away and, for v2.0f fits, the travel columns), posterior means.
+    Zero for a fit without these terms. Prediction code adds them through the goalie
+    offsets: gamma_away -= shift_home, gamma_home -= shift_away."""
+    m = {n: float(np.mean(draws[n])) for n in ALL_REST_VARS if n in draws}
+    if "trav_off" in m and not all(f"{f}_home" in x for f in TRAVEL_FEATURES):
+        raise ValueError("this fit has travel terms (v2.0f); pass the schedule context columns "
+                         "(src.processing.schedule_context)")
+    if "kappa_lineup" in m and not ("lin_home" in x and "lin_away" in x):
+        raise ValueError("this fit has a lineup term (v2.2); pass lin_home / lin_away")
+    if "gk_b2b" in m and not ("g2b_home" in x and "g2b_away" in x):
+        raise ValueError("this fit has a goalie-rest term (v2.0g); pass g2b_home / g2b_away")
+    return _shift(m, x)
 
 
 def rest_shift(draws: dict, b2b_home, b2b_away):
@@ -344,12 +443,10 @@ def rest_shift(draws: dict, b2b_home, b2b_away):
     gamma_home -= shift_away, so every downstream function works unchanged.
     """
     b2b_home, b2b_away = np.asarray(b2b_home, float), np.asarray(b2b_away, float)
-    if "rest_off_home" not in draws:
-        return np.zeros_like(b2b_home), np.zeros_like(b2b_away)
-    m = {n: float(np.mean(draws[n])) for n in REST_VARS}
-    sh = -m["rest_off_home"] * b2b_home + m["rest_def_away"] * b2b_away
-    sa = -m["rest_off_away"] * b2b_away + m["rest_def_home"] * b2b_home
-    return sh, sa
+    m = {n: float(np.mean(draws[n])) for n in ALL_REST_VARS if n in draws}
+    if "trav_off" in m or "gk_b2b" in m or "kappa_lineup" in m:
+        raise ValueError("this fit has travel / goalie-rest terms: use context_shift with the full context")
+    return _shift(m, {"b2b_home": b2b_home, "b2b_away": b2b_away})
 
 
 def game_steps(gt: pd.DataFrame, step_days: int) -> np.ndarray:
@@ -366,17 +463,15 @@ def game_rates(d: dict, gt: pd.DataFrame, draw_idx=None, reps: int = 1):
     k = np.tile(game_steps(gt, d["step_days"]), reps)
     hi, ai = np.tile(gt["home_idx"].to_numpy(), reps), np.tile(gt["away_idx"].to_numpy(), reps)
     gh, ga = np.tile(gt["gamma_home"].to_numpy(), reps), np.tile(gt["gamma_away"].to_numpy(), reps)
-    b2b_h = np.tile(gt["b2b_home"].to_numpy(float), reps) if "b2b_home" in gt else np.zeros(len(k))
-    b2b_a = np.tile(gt["b2b_away"].to_numpy(float), reps) if "b2b_away" in gt else np.zeros(len(k))
+    x = {c: np.tile(gt[c].to_numpy(float), reps) if c in gt else np.zeros(len(k))
+         for c in ["b2b_home", "b2b_away", "g2b_home", "g2b_away", "lin_home", "lin_away"]
+         + [f"{f}_{sd}" for f in TRAVEL_FEATURES for sd in ("home", "away")]}
     if draw_idx is None:
-        m = {n: d[n].mean(axis=0) for n in PATH_VARS + ["alpha_home", "beta_home_path", "delta_home"] + REST_VARS
+        m = {n: d[n].mean(axis=0) for n in PATH_VARS + ["alpha_home", "beta_home_path", "delta_home"] + ALL_REST_VARS
              if n in d}
         lvl = m["beta0_path"][k] + m["delta0_path"][k]
         home = m["beta_home_path"][k] + m["delta_home"] if "beta_home_path" in m else m["alpha_home"]
-        rh, ra = 0.0, 0.0
-        if "rest_off_home" in m:
-            rh = -m["rest_off_home"] * b2b_h + m["rest_def_away"] * b2b_a
-            ra = -m["rest_off_away"] * b2b_a + m["rest_def_home"] * b2b_h
+        rh, ra = _shift(m, x)
         lam_h = np.exp(lvl + home + m["xg_mu_off_path"][k, hi] + m["phi_off"][hi]
                        - m["xg_mu_def_path"][k, ai] - m["phi_def"][ai] - ga + rh)
         lam_a = np.exp(lvl + m["xg_mu_off_path"][k, ai] + m["phi_off"][ai]
@@ -385,10 +480,7 @@ def game_rates(d: dict, gt: pd.DataFrame, draw_idx=None, reps: int = 1):
     j = np.asarray(draw_idx)
     lvl = d["beta0_path"][j, k] + d["delta0_path"][j, k]
     home = d["beta_home_path"][j, k] + d["delta_home"][j] if "beta_home_path" in d else d["alpha_home"][j]
-    rh, ra = 0.0, 0.0
-    if "rest_off_home" in d:
-        rh = -d["rest_off_home"][j] * b2b_h + d["rest_def_away"][j] * b2b_a
-        ra = -d["rest_off_away"][j] * b2b_a + d["rest_def_home"][j] * b2b_h
+    rh, ra = _shift({n: d[n][j] for n in ALL_REST_VARS if n in d}, x)
     lam_h = np.exp(lvl + home + d["xg_mu_off_path"][j, k, hi] + d["phi_off"][j, hi]
                    - d["xg_mu_def_path"][j, k, ai] - d["phi_def"][j, ai] - ga + rh)
     lam_a = np.exp(lvl + d["xg_mu_off_path"][j, k, ai] + d["phi_off"][j, ai]
@@ -407,6 +499,9 @@ def simulate_league_tv(n_teams: int = 16, seasons: int = 2, games_per_team: int 
                        kappa: float = 9.0, rho: float = 0.5, season_days: int = 180,
                        off_season_days: int = 150, seed: int = 0,
                        rest_effects: tuple = (0.0, 0.0, 0.0, 0.0), b2b_share: float = 0.15,
+                       rest_goal_effects: tuple = (0.0, 0.0, 0.0, 0.0),
+                       travel_effects: dict | None = None, gk_b2b: float = 0.0,
+                       lineup_kappa: float = 0.0, lineup_sd: float = 0.0,
                        home_by_season: tuple | None = None):
     """Fake league with drifting team and league levels, in game-table format.
 
@@ -455,9 +550,28 @@ def simulate_league_tv(n_teams: int = 16, seasons: int = 2, games_per_team: int 
     bh = np.asarray(home_by_season)[season_of] if home_by_season is not None else beta_home
     nu_h = np.exp(b0[gd] + bh + off[gd, home] - dfn[gd, away] - r_off_h * b2b_h + r_def_a * b2b_a)
     nu_a = np.exp(b0[gd] + off[gd, away] - dfn[gd, home] - r_off_a * b2b_a + r_def_h * b2b_h)
+    # v2.0f schedule context: overnight km (on back-to-backs), time zones, 3-in-4 (mostly with a b2b)
+    ctx = {}
+    for sd, b in (("home", b2b_h), ("away", b2b_a)):
+        ctx[f"trav_{sd}"] = b * rng.uniform(0.2, 3.0, n_games)
+        ctx[f"tz_{sd}"] = rng.integers(0, 4, n_games) * (rng.random(n_games) < 0.3)
+        ctx[f"dense_{sd}"] = ((b == 1) & (rng.random(n_games) < 0.4)).astype(int)
+    lin_h = rng.normal(0, lineup_sd, n_games) if lineup_sd > 0 else np.zeros(n_games)   # v2.2
+    lin_a = rng.normal(0, lineup_sd, n_games) if lineup_sd > 0 else np.zeros(n_games)
+    nu_h = nu_h * np.exp(lineup_kappa * lin_h)
+    nu_a = nu_a * np.exp(lineup_kappa * lin_a)
+    te = travel_effects or {}
+    for f in TRAVEL_FEATURES:
+        eo, ed = te.get(f"{f}_off", 0.0), te.get(f"{f}_def", 0.0)
+        nu_h = nu_h * np.exp(-eo * ctx[f"{f}_home"] + ed * ctx[f"{f}_away"])
+        nu_a = nu_a * np.exp(-eo * ctx[f"{f}_away"] + ed * ctx[f"{f}_home"])
     xg_h, xg_a = rng.gamma(kappa, nu_h / kappa), rng.gamma(kappa, nu_a / kappa)
-    lam_h = nu_h * np.exp(d0[gd] - ga)
-    lam_a = nu_a * np.exp(d0[gd] - gh)
+    f_h, k_h, f_a, k_a = rest_goal_effects               # v2.0e: on goals per xG only
+    # v2.0g: on about a third of back-to-backs the same goalie starts both nights
+    g2b_h = ((b2b_h == 1) & (rng.random(n_games) < 0.35)).astype(int)
+    g2b_a = ((b2b_a == 1) & (rng.random(n_games) < 0.35)).astype(int)
+    lam_h = nu_h * np.exp(d0[gd] - ga - f_h * b2b_h + k_a * b2b_a + gk_b2b * g2b_a)
+    lam_a = nu_a * np.exp(d0[gd] - gh - f_a * b2b_a + k_h * b2b_h + gk_b2b * g2b_h)
     y_h, y_a = sample_scores(lam_h, lam_a, rho, rng)
 
     date0 = pd.Timestamp("2000-10-01")
@@ -469,9 +583,11 @@ def simulate_league_tv(n_teams: int = 16, seasons: int = 2, games_per_team: int 
         "home_goals": y_h, "away_goals": y_a, "home_goals_reg": y_h, "away_goals_reg": y_a,
         "home_xg_reg": xg_h, "away_xg_reg": xg_a,
         "home_goalie": 0, "away_goalie": 0, "gamma_home": gh, "gamma_away": ga,
-        "b2b_home": b2b_h, "b2b_away": b2b_a,
+        "b2b_home": b2b_h, "b2b_away": b2b_a, "g2b_home": g2b_h, "g2b_away": g2b_a, **ctx,
+        "lin_home": lin_h, "lin_away": lin_a,
     })
     truth = {"off": off, "def": dfn, "beta0": b0, "delta0": d0, "date0": date0,
-             "rest_effects": rest_effects, "home_by_season": home_by_season,
+             "rest_effects": rest_effects, "rest_goal_effects": rest_goal_effects,
+             "travel_effects": te, "gk_b2b": gk_b2b, "home_by_season": home_by_season,
              "tau_week": tau_week, "tau_summer": tau_summer}
     return gt, teams, truth

@@ -8,6 +8,13 @@ from src.models.schemas import (
 
 from datetime import date
 
+REQUEST_TIMEOUT = 30           # seconds; without one a stalled connection hangs forever, silently
+
+
+def _get(url: str):
+    """requests.get with a timeout (a stalled request raises requests.Timeout instead of hanging)."""
+    return requests.get(url, timeout=REQUEST_TIMEOUT)
+
 '''
 This module contains functions for fetching data from the NHL API,
 including team info, rosters, game boxscores, and schedules.
@@ -23,7 +30,7 @@ rebound/rush context derivation in src/processing/shot_context.py).
 ## Fetches team info from NHL API and returns a list of Team objects
 def fetch_teams() -> list[Team]:
     """Fetch all team info from NHL standings endpoint."""
-    response = requests.get(f"{NHL_API_BASE_URL}/v1/standings/now")
+    response = _get(f"{NHL_API_BASE_URL}/v1/standings/now")
     response.raise_for_status()
 
     standings = response.json()["standings"]
@@ -49,7 +56,7 @@ def fetch_teams() -> list[Team]:
 ## Fetches the current roster for a team and returns a list of Player objects
 def fetch_roster(team_abbrev: str) -> list[Player]:
     """Fetch the current roster for a team"""
-    response = requests.get(f"{NHL_API_BASE_URL}/v1/roster/{team_abbrev}/current")
+    response = _get(f"{NHL_API_BASE_URL}/v1/roster/{team_abbrev}/current")
     response.raise_for_status()
 
     data = response.json()
@@ -85,7 +92,7 @@ def fetch_roster(team_abbrev: str) -> list[Player]:
 ## Fetches boxscore data for a game and returns a dict with Game, SkaterGameStats, and GoalieGameStats
 def fetch_boxscore(game_id: int) -> dict:
     """Fetch boxscore for a single game. Returns game, skater stats and goalie stats."""
-    response = requests.get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/boxscore")
+    response = _get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/boxscore")
     response.raise_for_status()
 
     data = response.json()
@@ -165,7 +172,7 @@ def fetch_schedule(team_abbrev: str, season: str | None = None) -> list[Schedule
     else:
         url = f"{NHL_API_BASE_URL}/v1/club-schedule-season/{team_abbrev}/{season}"
 
-    response = requests.get(url)
+    response = _get(url)
     response.raise_for_status()
 
     data = response.json()
@@ -197,7 +204,7 @@ def fetch_pbp_json(game_id: int) -> dict:
     Feed the result to parse_shot_events() and parse_game_events() so a
     single download serves both the shot_events and game_events tables.
     """
-    response = requests.get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/play-by-play")
+    response = _get(f"{NHL_API_BASE_URL}/v1/gamecenter/{game_id}/play-by-play")
     response.raise_for_status()
     return response.json()
 
@@ -290,9 +297,16 @@ def fetch_game_events(game_id: int) -> list[GameEvent]:
     return parse_game_events(fetch_pbp_json(game_id), game_id)
 
 
+GOAL_TYPE_CODE = 505           # shift-chart goal markers (not shifts; no duration)
+
+
 def fetch_shifts(game_id: int) -> list[Shift]:
-    """Fetch shift data for a single game."""
-    response = requests.get(f"https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={game_id}"
+    """Fetch shift data for a single game.
+
+    Rows without a player (the feed has a few in some games) are skipped instead of failing
+    the whole game, and so are goal markers (typeCode 505), which are not shifts.
+    """
+    response = _get(f"https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={game_id}"
     )
     response.raise_for_status()
 
@@ -300,14 +314,18 @@ def fetch_shifts(game_id: int) -> list[Shift]:
     shifts = []
 
     for entry in data["data"]:
+        if entry.get("playerId") is None:
+            continue
+        if entry.get("typeCode") == GOAL_TYPE_CODE:
+            continue
         shifts.append(Shift(
             id=entry["id"],
             game_id=entry["gameId"],
             player_id=entry["playerId"],
             team_id=entry["teamId"],
             team_abbrev=entry["teamAbbrev"],
-            first_name=entry["firstName"],
-            last_name=entry["lastName"],
+            first_name=entry.get("firstName") or "",
+            last_name=entry.get("lastName") or "",
             period=entry["period"],
             shift_number=entry["shiftNumber"],
             start_time=entry["startTime"],

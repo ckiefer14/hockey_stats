@@ -15,6 +15,9 @@ Usage (from the project root):
     py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --step-days 2
     py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest
     py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest --home-drift
+    py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest --rest-goals
+    py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest --travel
+    py -m src.pipelines.backtest_season --season 20252026 --model tv --window 730 --rest --goalie-rest
 
 Writes output/backtests/trackb_w<window>_<season>.csv (predictions, appended after every
 refit; stop any time and rerun to resume) and, when the season is complete,
@@ -63,6 +66,18 @@ def main():
                         help="v2.0 only: days per random-walk step (7 = weekly, 2 = about one per game)")
     parser.add_argument("--rest", action="store_true", help="v2.0d: back-to-back effects")
     parser.add_argument("--home-drift", action="store_true", help="v2.0d: home ice changes by season")
+    parser.add_argument("--rest-goals", action="store_true",
+                        help="v2.0e: back-to-back effects on goals per xG (finishing, goaltending)")
+    parser.add_argument("--travel", action="store_true",
+                        help="v2.0f: overnight travel, time zones, 3 games in 4 nights")
+    parser.add_argument("--xg-layer", action="store_true",
+                        help="v2.1: team xG adjusted for the shooters' finishing (as of each week; build_xg_asof)")
+    parser.add_argument("--goalie-layer", action="store_true",
+                        help="v2.1: goalie offsets from the xG layer instead of the Phase 3 rating")
+    parser.add_argument("--lineup", action="store_true",
+                        help="v2.2: lineup strength vs usual from as-of player ratings (build_lineup_asof)")
+    parser.add_argument("--goalie-rest", action="store_true",
+                        help="v2.0g: starting goalie on zero rest (also started yesterday)")
     parser.add_argument("--half-life", type=float, default=None,
                         help="v1.1 only: recency half-life in days (older games count less)")
     parser.add_argument("--seed", type=int, default=42)
@@ -72,9 +87,12 @@ def main():
     BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
     if args.half_life and args.model != "xg":
         raise SystemExit("--half-life is only supported with --model xg")
-    if (args.rest or args.home_drift) and args.model != "tv":
-        raise SystemExit("--rest / --home-drift need --model tv")
-    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift)
+    if (args.rest or args.home_drift or args.rest_goals or args.travel or args.goalie_rest or args.lineup) \
+            and args.model != "tv":
+        raise SystemExit("--rest / --home-drift / --rest-goals / --travel / --goalie-rest need --model tv")
+    label = model_label(args.model, args.window, args.half_life, args.step_days, args.rest, args.home_drift,
+                        args.rest_goals, args.travel, args.goalie_rest, args.xg_layer, args.goalie_layer,
+                        args.lineup)
     out = BACKTEST_DIR / f"{label}_{args.season}.csv"
     scored = BACKTEST_DIR / f"{label}_{args.season}_scored.csv"
     if args.restart:
@@ -87,7 +105,9 @@ def main():
     walk_forward(conn, args.season, window_days=args.window, refit_days=args.refit_days,
                  score_sims=args.score_sims, seed=args.seed, out_path=out,
                  model=args.model, half_life=args.half_life, step_days=args.step_days,
-                 rest=args.rest, home_drift=args.home_drift)
+                 rest=args.rest, home_drift=args.home_drift, rest_goals=args.rest_goals, travel=args.travel,
+                 goalie_rest=args.goalie_rest, xg_layer=args.xg_layer, goalie_layer=args.goalie_layer,
+                 lineup=args.lineup)
 
     preds = add_results(conn, pd.read_csv(out, parse_dates=["game_date"]))
     conn.close()

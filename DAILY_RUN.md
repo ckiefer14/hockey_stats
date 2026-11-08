@@ -15,6 +15,24 @@ py -m src.pipelines.predict_day
 py -m src.pipelines.log_odds
 ```
 
+**Lineups.** `predict_day` prints each team's assumed lineup and what it did to that team's expected xG, e.g.
+`EDM lineup (assumed, xG shift -4.7%): out: Leon Draisaitl (Out); fills in: ...`. It starts from the last dressed lineup,
+drops anyone not on today's NHL roster or listed **Out** by ESPN, keeps **day-to-day** players (flagged), brings back
+healthy regulars, and fills gaps from the roster. Read those lines: if you know better (a late scratch, a call-up),
+re-predict with overrides:
+
+```powershell
+py -m src.pipelines.predict_day --replace --out EDM=Draisaitl --in EDM=Savoie
+py -m src.pipelines.predict_day --replace --dtd-out          # treat every day-to-day player as out
+py -m src.pipelines.predict_day --replace --show-lineups     # print every team's full 18 by name
+```
+
+To check the assumptions, compare the notes (and `--show-lineups`) with ESPN's NHL injuries page, Daily Faceoff's
+line combinations (projected lineups from morning skates) and team beat reporters.
+
+If the NHL has already posted the dressed lineup (the morning roster is about 23 per team; the dressed lineup is 18
+skaters), it is used as is and the line says `posted`. If a feed is down the line says so and the rest still works.
+
 - Optional: run `py -m src.pipelines.log_odds` again shortly before the first game. Scoring uses each game's **last line taken before it started**, so a later snapshot is closer to the closing line (1 credit per run; the free plan has 500 a month).
 
 - `score_xg` must run before the postgame cards (they need each shot's xG).
@@ -30,17 +48,21 @@ py -m src.pipelines.make_cards postgame --pending
 
 # Weekly: grade the forward test, then refit
 py -m src.pipelines.score_forward
-py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 + back-to-backs (default): ~12 min
+py -m src.pipelines.build_stints                    # new games' stints (seconds)
+py -m src.pipelines.build_lineup_asof               # newest player ratings + lineup context (a few min)
+py -m src.pipelines.fit_hierarchical --draws 2000   # v2.0 + back-to-backs + lineup (default): ~12-15 min
 py -m src.processing.late_game
 py -m src.processing.score_state
 py -m src.pipelines.build_pce            # optional: refresh the Phase 8 indices
+py -m src.pipelines.playoff_odds         # playoff odds from the new fit (~1-2 min) + charts:
+                                         #   output/playoffs/playoff_board_<date>.png, playoff_trend_<season>.png
 
 # 2. Today
 py -m src.pipelines.predict_day
 py -m src.pipelines.log_odds
 ```
 
-The fit is Track B v2.0 + back-to-back effects (time-varying ratings, 730-day window, weekly steps, rest on by default). `--draws 2000` keeps R-hat and ESS clean; `--no-rest` fits plain v2.0, `--model xg` fits v1.1. `predict_day` looks up each team's rest itself and tags games with `[TEAM back-to-back]`. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
+The fit is Track B v2.0 + back-to-back effects + lineup (time-varying ratings, 730-day window, weekly steps; rest and lineup on by default). `--draws 2000` keeps R-hat and ESS clean; `--no-lineup` fits v2.0 + rest (the model before 2026-11-08), `--no-rest --no-lineup` plain v2.0, `--model xg` v1.1. The fit **stops** if the stints or player ratings are behind the loaded games, and says which command to run. `predict_day` looks up each team's rest itself and tags games with `[TEAM back-to-back]`. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
 
 Refit in the **morning**, not at night: a fit made after a day's games includes them, so that day can no longer be predicted.
 

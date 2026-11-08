@@ -11,6 +11,16 @@ compute:
   score-state simulator (official final scores, OT/SO winner +1, empty-net
   goals included). Build it from simulated scores with
   ``final_score_matrix(home_goals, away_goals)``.
+- ``home_ctx`` / ``away_ctx`` (v2, optional): what the model knew about each
+  team tonight, drawn as a band under the header:
+      playoff: dict p_playoffs, points_now, gp_now, points_mean, points_lo,
+               points_hi, date (latest playoff_odds run on or before the game)
+      rest (days since the last game, NaN = first game), b2b, dense (3 in 4
+               nights), km (from the last arena), g2b (starter also started
+               yesterday)
+      lineup_source ("posted" / "assumed" / "none"), lineup_notes (the
+               "; "-joined notes from live_lineup), lin (log xG-rate shift)
+  Without either the card is drawn as before (old log rows).
 
 Usage::
 
@@ -23,8 +33,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import math
+import textwrap
+
 import numpy as np
-from matplotlib.patches import Rectangle
+from matplotlib.patches import FancyBboxPatch, Rectangle
 
 from . import card_style as cs
 
@@ -47,6 +60,8 @@ class PregameData:
     model_label: str = ""                   # e.g. "Track B v1.1 · trackbxg_w365_20260417"
     note: str = ""                          # free text for the footer
     colors: tuple | None = None             # (home, away); None = team colours
+    home_ctx: dict | None = None            # v2 context band (see module docstring)
+    away_ctx: dict | None = None
 
 
 # --------------------------------------------------------------------------
@@ -86,17 +101,18 @@ def score_summaries(final_scores: np.ndarray) -> dict:
 # panels
 # --------------------------------------------------------------------------
 
-def _header(fig, d: PregameData, top: float):
+def _header(fig, d: PregameData, top: float, k: float = 1.0):
+    """k = 11 / figure height in inches (keeps the spacing of the 11-inch card)."""
     hc, ac = cs.ink_for(d.colors[0]), cs.ink_for(d.colors[1])
     fig.text(0.04, top, f"{d.away}", fontsize=26, fontweight="bold", color=ac,
              va="top")
     w_away = 0.016 * max(len(d.away), 3) + 0.035
-    fig.text(0.04 + w_away, top - 0.004, "at", fontsize=16, color=cs.MUTED, va="top")
+    fig.text(0.04 + w_away, top - 0.004 * k, "at", fontsize=16, color=cs.MUTED, va="top")
     fig.text(0.04 + w_away + 0.032, top, f"{d.home}", fontsize=26,
              fontweight="bold", color=hc, va="top")
-    fig.text(0.96, top - 0.002, "PREGAME", fontsize=10, color=cs.MUTED,
+    fig.text(0.96, top - 0.002 * k, "PREGAME", fontsize=10, color=cs.MUTED,
              fontweight="bold", ha="right", va="top")
-    fig.text(0.96, top - 0.027, d.date, fontsize=13, color=cs.INK, ha="right",
+    fig.text(0.96, top - 0.027 * k, d.date, fontsize=13, color=cs.INK, ha="right",
              va="top")
 
     def g(name, ok):
@@ -104,7 +120,7 @@ def _header(fig, d: PregameData, top: float):
             return "starter unknown"
         return f"{name} ({'confirmed' if ok else 'projected'})"
 
-    fig.text(0.04, top - 0.052,
+    fig.text(0.04, top - 0.052 * k,
              f"Goalies:  {d.away} {g(d.away_goalie, d.away_goalie_confirmed)}"
              f"   ·   {d.home} {g(d.home_goalie, d.home_goalie_confirmed)}",
              fontsize=9.5, color=cs.INK_2, va="top")
@@ -191,7 +207,7 @@ def _odds_tiles(fig, rect, d: PregameData, s: dict):
         r, c = divmod(i, cols)
         tx = x0 + c * (tw + gap)
         ty = y0 + h - 0.045 - (r + 1) * th - r * gap
-        fig.patches.append(Rectangle((tx, ty), tw, th, transform=fig.transFigure,
+        fig.patches.append(Rectangle((tx, ty), tw, th, transform=fig.transSubfigure,
                                      facecolor=cs.PAGE, edgecolor="none",
                                      zorder=-5))
         fig.text(tx + 0.012, ty + th - 0.008, label, fontsize=8.5,
@@ -320,34 +336,193 @@ def _totals(fig, rect, d: PregameData, s: dict):
 
 
 # --------------------------------------------------------------------------
+# v2 context band: playoff odds, rest, lineup
+# --------------------------------------------------------------------------
+
+FATIGUE = cs.tint(cs.AWAY, 0.78)            # chip fill for tiring schedule spots
+STATUS_SHORT = {"Injured Reserve": "IR", "Day-To-Day": "DTD", "not on today's roster": "not on roster"}
+NOTE_GROUPS = [                             # live_lineup note prefix -> label on the card
+    ("out (given): ", "Out (given)"), ("out: ", "Out"), ("back: ", "Back"), ("fills in: ", "Fills in"),
+    ("in (given): ", "In (given)"), ("assumed scratched: ", "Scratched"),
+    ("day-to-day, assumed in: ", "Day-to-day, playing"),
+]
+SOURCE_TEXT = {"posted": "NHL posted lineup", "assumed": "assumed (last game + injuries)",
+               "none": "no earlier game"}
+
+
+def _num(v, default=None):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(v) else v
+
+
+def rest_tags(c: dict) -> list[tuple[str, bool]]:
+    """(text, tiring?) chips for one team's schedule spot."""
+    tags = []
+    rest, km = _num(c.get("rest")), _num(c.get("km"), 0.0)
+    if _num(c.get("b2b"), 0):
+        tags.append(("Back-to-back" + (f" · {km:,.0f} km overnight" if km >= 100 else ""), True))
+    elif rest is None:
+        tags.append(("First game of the season", False))
+    else:
+        off = int(rest) - 1
+        tags.append((f"{off} day{'s' if off != 1 else ''} off" if off < 7 else "Week+ off", False))
+        if km >= 1000 and rest <= 2:
+            tags.append((f"{km:,.0f} km since last game", False))
+    if _num(c.get("dense"), 0):
+        tags.append(("3rd game in 4 nights", True))
+    if _num(c.get("g2b"), 0):
+        tags.append(("Goalie also started last night", True))
+    return tags
+
+
+def lineup_lines(notes: str) -> list[str]:
+    """live_lineup notes, grouped: 'Out: A (IR), B · Back: C'."""
+    groups, other = {}, []
+    for n in [x.strip() for x in str(notes or "").split(";") if x.strip()]:
+        for pre, label in NOTE_GROUPS:
+            if n.startswith(pre):
+                who = n[len(pre):]
+                for long, short in STATUS_SHORT.items():
+                    who = who.replace(f"({long})", f"({short})")
+                groups.setdefault(label, []).append(who)
+                break
+        else:
+            if n not in ("NHL posted the dressed lineup", "no earlier game"):
+                other.append(n)
+    parts = [f"{k}: {', '.join(v)}" for k, v in groups.items()] + other
+    return parts
+
+
+def _chips(fig, x, y, tags, max_x):
+    """Row of rounded chips starting at (x, y) (figure fraction, y = chip middle)."""
+    r = fig.canvas.get_renderer()
+    fw, fh = fig.get_size_inches() * fig.dpi
+    pad_x, h = 0.007, 0.024 * 11 / fig.get_size_inches()[1]
+    for text, tiring in tags:
+        t = fig.text(x + pad_x, y, text, fontsize=8.5, va="center",
+                     color=cs.INK if tiring else cs.INK_2,
+                     fontweight="bold" if tiring else "normal")
+        w = t.get_window_extent(renderer=r).width / fw + 2 * pad_x
+        if x + w > max_x:                      # no room: drop the rest
+            t.remove()
+            break
+        fig.patches.append(FancyBboxPatch((x, y - h / 2), w, h, boxstyle="round,pad=0,rounding_size=0.006",
+                                          transform=fig.transFigure, facecolor=FATIGUE if tiring else cs.PAGE,
+                                          edgecolor="none", zorder=-5))
+        x += w + 0.008
+
+
+def _team_context(fig, x0, x1, top, k, team, color, c: dict | None, game_date: str = ""):
+    """One team's column of the band. top = figure fraction of the column top."""
+    ink = cs.ink_for(color)
+    Y = lambda inches: top - inches / 11 * k          # inches below the column top -> figure fraction
+    fig.text(x0, Y(0.0), team, fontsize=14, fontweight="bold", color=ink, va="top")
+    if not c:
+        fig.text(x0, Y(0.40), "no context logged for this game", fontsize=8.5, color=cs.MUTED, va="top")
+        return
+    po = c.get("playoff")
+    if po:
+        pp = po["p_playoffs"]
+        ptxt = ">99.9%" if pp > 0.999 else "<0.1%" if pp < 0.001 else cs.pct(pp)
+        fig.text(x1, Y(0.0), f"Playoffs {ptxt}", fontsize=14, fontweight="bold",
+                 color=ink, ha="right", va="top")
+        sub = (f"{int(po['points_now'])} pts in {int(po['gp_now'])} GP · projected "
+               f"{po['points_mean']:.0f} ({po['points_lo']:.0f}–{po['points_hi']:.0f})")
+        if po.get("date") and str(po["date"]) != str(game_date):
+            sub += f" · odds of {po['date']}"
+        fig.text(x1, Y(0.27), sub, fontsize=8.5, color=cs.MUTED, ha="right", va="top")
+    else:
+        fig.text(x1, Y(0.05), "no playoff odds run yet", fontsize=8.5, color=cs.MUTED, ha="right", va="top")
+
+    _chips(fig, x0, Y(0.66), rest_tags(c), x1)
+
+    src = c.get("lineup_source")
+    lin = _num(c.get("lin"))
+    if src is None or (isinstance(src, float) and math.isnan(src)):
+        fig.text(x0, Y(0.92), "Lineup: not used by this model", fontsize=9, color=cs.MUTED, va="top")
+        return
+    head = f"Lineup · {SOURCE_TEXT.get(str(src), str(src))}"
+    fig.text(x0, Y(0.92), head, fontsize=9, fontweight="bold", color=cs.INK, va="top")
+    if lin is not None:
+        sh = math.expm1(lin)
+        word = "about usual" if abs(sh) < 0.01 else "stronger" if sh > 0 else "weaker"
+        fig.text(x1, Y(0.92), f"xG vs usual lineup {sh:+.1%} ({word})".replace("-", "−"), fontsize=9, fontweight="bold",
+                 color=cs.INK if abs(sh) >= 0.01 else cs.INK_2, ha="right", va="top")
+    parts = lineup_lines(c.get("lineup_notes"))
+    text = " · ".join(parts) if parts else "same lineup as the last game"
+    width = max(40, int((x1 - x0) * fig.get_size_inches()[0] * 72 / 4.6))   # ~chars per line at 8.5 pt
+    lines = textwrap.wrap(text, width)
+    if len(lines) > 2:
+        lines = lines[:2]
+        lines[1] = textwrap.shorten(lines[1] + " …", width, placeholder=" …")
+    fig.text(x0, Y(1.17), "\n".join(lines), fontsize=8.5, color=cs.INK_2, va="top", linespacing=1.35)
+
+
+def _context_band(fig, d: PregameData, top: float, bottom: float, k: float):
+    hc, ac = d.colors
+    cs.card_background(fig, [(0.025, bottom, 0.975, top)])
+    pad = 0.18 / 11 * k
+    fig.add_artist(matplotlib_line(0.5, bottom + pad, top - pad))
+    _team_context(fig, 0.05, 0.475, top - pad, k, d.away, ac, d.away_ctx, d.date)
+    _team_context(fig, 0.525, 0.95, top - pad, k, d.home, hc, d.home_ctx, d.date)
+
+
+def matplotlib_line(x, y0, y1):
+    from matplotlib.lines import Line2D
+    return Line2D([x, x], [y0, y1], color=cs.GRID, lw=1)
+
+
+# --------------------------------------------------------------------------
 # card
 # --------------------------------------------------------------------------
 
-def plot_pregame_card(d: PregameData):
-    """Draw the pregame card and return the figure."""
-    if d.colors is None:
-        d = replace(d, colors=cs.matchup_colors(d.home, d.away))
-    s = score_summaries(d.final_scores)
-    fig = cs.new_figure(12, 11)
-
+def _body(fig, d: PregameData, s: dict):
+    """Everything below the header, laid out on an 11-inch-tall figure (or subfigure)."""
     cs.card_background(fig, [
         (0.025, 0.635, 0.975, 0.895),   # hero + tiles
         (0.025, 0.515, 0.975, 0.62),    # win paths
         (0.025, 0.055, 0.975, 0.50),    # score grid + totals
     ])
-
-    _header(fig, d, top=0.965)
     _hero(fig, (0.05, 0.678, 0.50, 0.202), d)
     _odds_tiles(fig, (0.60, 0.655, 0.355, 0.225), d, s)
     _win_paths(fig, (0.05, 0.527, 0.90, 0.07), d)
     _score_grid(fig, (0.04, 0.09, 0.44, 0.35), d)
     _totals(fig, (0.56, 0.105, 0.39, 0.335), d, s)
 
-    foot = d.model_label or "Track B v1.1"
+    foot = d.model_label or "Track B"
     if d.note:
         foot += f"   ·   {d.note}"
     fig.text(0.04, 0.025, foot, fontsize=8, color=cs.MUTED, va="bottom")
     fig.text(0.96, 0.025, "P(win): exact game model per draw · scores: "
                           "score-state simulator", fontsize=8, color=cs.MUTED,
              ha="right", va="bottom")
+
+
+BAND_IN = 2.15                          # extra height (inches) for the v2 context band
+
+
+def plot_pregame_card(d: PregameData):
+    """Draw the pregame card and return the figure."""
+    if d.colors is None:
+        d = replace(d, colors=cs.matchup_colors(d.home, d.away))
+    s = score_summaries(d.final_scores)
+    if d.home_ctx is None and d.away_ctx is None:        # old log rows: the v1 card
+        fig = cs.new_figure(12, 11)
+        _header(fig, d, top=0.965)
+        _body(fig, d, s)
+        return fig
+
+    H = 11 + BAND_IN
+    k = 11 / H
+    fig = cs.new_figure(12, H)
+    # the old 11-inch body, unchanged, in the bottom 11 inches (its header area stays empty)
+    body = fig.subfigures(2, 1, height_ratios=[BAND_IN, 11], hspace=0, facecolor="none")[1]
+    _header(fig, d, top=1 - 0.035 * k, k=k)
+    band_top = 1 - 1.2 / H
+    band_bottom = (0.895 * 11 + 0.165) / H                # 0.165 in above the hero panel
+    _context_band(fig, d, band_top, band_bottom, k)
+    _body(body, d, s)
     return fig
