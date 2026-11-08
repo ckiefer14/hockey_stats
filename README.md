@@ -1352,7 +1352,7 @@ and the mirror image for the away side. Each skater gets an offensive effect $o_
 - Stanley Cup / round-by-round odds (bracket simulation, best-of-7, playoff OT without shootouts).
 - A historical check: run as of past dates with fits ending then, and score P(playoffs) against what happened.
 
-### v2.5 — Visuals for v2 — IN PROGRESS
+### v2.5 — Visuals for v2 — DONE (2026-11-08)
 Order: (1) pregame card upgrade, (2) playoff odds chart, (3) team card, (4) player card.
 
 **(1) Pregame card — DONE (2026-11-08).** `src/viz/pregame_card.py`, `src/viz/card_style.py`,
@@ -1376,6 +1376,53 @@ logged game with `py -m src.pipelines.make_cards pregame <game_id>`.
   labelled at the line ends. Grows with each weekly run.
 Team colours: a team whose colour is too close to a division rival's switches to its next team
 colour; if none works its line is dashed. Labels always name the team.
+
+**(3) Team card — DONE (2026-11-08).** `src/viz/team_card.py`, `src/pipelines/make_team_card.py`
+(`py -m src.pipelines.make_team_card BOS` or `--all`; output/teams/<fit date>/<TEAM>.png). Per team:
+- league rank overall / offense / defense, with 90% ranges (rank in each posterior draw);
+- weekly offense and defense paths over the fit window (xg_mu_*_path + phi_*, as % better than an
+  average team) with 90% bands, against the spread of all teams; off-seasons squeezed to 3 weeks.
+  The week dates are rebuilt from the fit's games (time_grid); the card stops if they no longer
+  match the fit (database changed: refit first);
+- inside the ratings now: shot quality for / against (xG part) and finishing for / against (phi);
+- goalies: share of the last 20 starts and Phase 3 rating (1 − theta, 90% range). The defense
+  rating excludes the starter, who enters the model separately;
+- playoff odds through the season and the latest projection (from the playoff_odds history).
+
+**(3b) Rankings card — DONE (2026-11-08).** `src/viz/rankings_card.py`; `make_team_card --rankings`
+(also made by `--all`; output/teams/<fit date>/rankings.png). All teams on one card: position,
+record, net rating (% better than average, 90% range), rank range, offense and defense positions,
+playoff odds and projected points. Fix: the team cards used the median rank across posterior
+draws, which can give two teams the same rank and skip another (no "2nd"). Positions now come
+from one league ordering by the posterior mean rating (`league_table`), shared by both cards, so
+every position is used once; the "likely" range is still the 5th-95th percentile of the rank.
+
+**(4) Player card — DONE (2026-11-08).** `src/viz/player_card.py`, `src/pipelines/make_player_card.py`
+(`py -m src.pipelines.make_player_card McDavid`, ids, `--team EDM`, or `--all` for every rated skater who
+played this season, about 3-6 min; output/players/<rating date>/, one folder per team with --team / --all).
+Percentile bars among regulars at the player's position (forwards / defensemen with 300+ 5v5
+minutes in the 2-season window): dot = where the mean rating ranks, whisker = where the ends of
+its 90% range rank.
+- Offense / defense / net: v2.2 `player_rating_asof` (newest fit date). Net sd assumes offense
+  and defense independent (no covariance stored).
+- Finishing: v2.1 xG layer shooter effect (`xg_layer_<season>_beta.csv` from `fit_xg_layer
+  --final`, all four terms, all loaded seasons), among shooters with 150+ shots; shows goals vs
+  xG. Now refreshed weekly (DAILY_RUN). The card notes it if the fit is more than 10 days behind
+  the scored shots. v2.1 is still not part of the game model; this is display only.
+- Usage: games and TOI this season, 5v5 minutes in the window; net impact over time (every
+  rating fit) against the middle 80% of regulars at the position.
+Not included: linemate quality (would need a separate stint summary).
+
+**(5) Goalie card — DONE (2026-11-08).** `src/pipelines/make_goalie_card.py` (draws with the player
+card's layout; `player_card.py` gained trend title / % axis / card-kind options). Names, ids,
+`--team BOS` or `--all` (every goalie who started this season); output/goalies/<date>/.
+Percentile bars among regular goalies (1,500+ shots faced in the 2-season window):
+- Goals kept out: Phase 3 goalie rating (1 − theta, 90% range), the game model's goalie input;
+- Shooter-adjusted: v2.1 xG layer goalie effect (1 − exp(−gamma)), display only;
+- This season only: 1 − GA / xGA (league-adjusted), no shrinkage, Poisson range; 200+ shots.
+Tiles: starts and share of the team's starts, save % (shots on goal, periods 1-4), goals saved
+above expected this season, goals per game vs an average goalie at the window's average
+workload. Trend: Phase 3 rating weekly (in-season weeks) against the middle 80% of regulars.
 
 ### v2.3 — Other Candidate Improvements
 

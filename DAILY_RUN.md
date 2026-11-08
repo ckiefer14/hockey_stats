@@ -56,6 +56,12 @@ py -m src.processing.score_state
 py -m src.pipelines.build_pce            # optional: refresh the Phase 8 indices
 py -m src.pipelines.playoff_odds         # playoff odds from the new fit (~1-2 min) + charts:
                                          #   output/playoffs/playoff_board_<date>.png, playoff_trend_<season>.png
+py -m src.pipelines.make_team_card --all  # team cards + rankings card (~1 min): output/teams/<date>/<TEAM>.png, rankings.png
+py -m src.pipelines.fit_xg_layer --final  # shooter finishing (and goalie / rink) effects for the player cards (a few min)
+py -m src.pipelines.make_player_card --all   # every rated skater this season (~3-6 min); or names / ids / --team BOS
+                                              #   output/players/<date>/<TEAM>/<Name>_<id>.png
+py -m src.pipelines.make_goalie_card --all   # every goalie who started this season (~1 min); or names / ids / --team BOS
+                                              #   output/goalies/<date>/<TEAM>/<Name>_<id>.png
 
 # 2. Today
 py -m src.pipelines.predict_day
