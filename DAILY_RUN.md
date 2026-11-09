@@ -13,7 +13,17 @@ py -m src.pipelines.make_cards postgame --pending
 # 2. Today: predictions + pregame cards, then the market's lines for the same games
 py -m src.pipelines.predict_day
 py -m src.pipelines.log_odds
+
+# 3. Closing lines: waits and snapshots ~10 min before each start time (skip if Task Scheduler runs it)
+py -m src.pipelines.log_closing
 ```
+
+About 5 minutes, plus `log_closing` sitting in its window until the last game starts.
+
+- `score_xg` must run before the postgame cards (they need each shot's xG).
+- `predict_day` goes after the loading so it uses the newest goalie history. Each pregame card shows the context band
+  (playoff odds, rest, lineups) and the "Why" strip: how many points of win chance home ice, team ratings, goalies,
+  rest & travel and lineups each add, from an even game to the final number.
 
 **Lineups.** `predict_day` prints each team's assumed lineup and what it did to that team's expected xG, e.g.
 `EDM lineup (assumed, xG shift -4.7%): out: Leon Draisaitl (Out); fills in: ...`. It starts from the last dressed lineup,
@@ -33,10 +43,6 @@ line combinations (projected lineups from morning skates) and team beat reporter
 If the NHL has already posted the dressed lineup (the morning roster is about 23 per team; the dressed lineup is 18
 skaters), it is used as is and the line says `posted`. If a feed is down the line says so and the rest still works.
 
-- **Closing lines (every game day):** `py -m src.pipelines.log_closing` waits and takes one snapshot about 10 minutes before each group of start times (3-5 a night, 1 credit each), so every game gets a line from just before puck drop. Start it any time before the first game and leave the window open, or let Task Scheduler start it (see "Closing lines" below). `--dry-run` shows the plan without using credits. Scoring uses each game's **last line taken before it started**.
-
-- `score_xg` must run before the postgame cards (they need each shot's xG).
-- `predict_day` goes last so it uses the newest goalie history.
 
 ## Once a week (same morning, before `predict_day`)
 
@@ -66,7 +72,13 @@ py -m src.pipelines.make_goalie_card --all   # every goalie who started this sea
 # 2. Today
 py -m src.pipelines.predict_day
 py -m src.pipelines.log_odds
+py -m src.pipelines.log_closing
 ```
+
+About 35-45 minutes in all (the fit is most of it). Order matters: stints and player ratings before the fit (the fit
+stops otherwise), the fit before `late_game` / `score_state`, and those before `playoff_odds`, the cards and
+`predict_day` (they all read the new fit). The team cards stop if games were loaded after the fit, so run them the same
+morning as the refit.
 
 The fit is Track B v2.0 + back-to-back effects + lineup (time-varying ratings, 730-day window, weekly steps; rest and lineup on by default). `--draws 2000` keeps R-hat and ESS clean; `--no-lineup` fits v2.0 + rest (the model before 2026-11-08), `--no-rest --no-lineup` plain v2.0, `--model xg` v1.1. The fit **stops** if the stints or player ratings are behind the loaded games, and says which command to run. `predict_day` looks up each team's rest itself and tags games with `[TEAM back-to-back]`. Each fit file is about 50–70 MB: delete old ones in `output/posteriors/` now and then (the active one is named in `active_fit.json`).
 
@@ -124,6 +136,11 @@ py -m src.pipelines.predict_day --replace          # re-predict every game today
 | `make_cards postgame --date 2026-10-24` | Postgame cards for every loaded game on a date (predicted or not) |
 | `make_cards postgame 2026020180` | One game by id (`--redo` redraws an existing card) |
 | `make_cards pregame 2026020180` | Redraw a pregame card from the log |
+| `log_closing --dry-run` | Today's closing-line plan, no credits used |
+| `playoff_odds --tau-scale 1` | Playoff odds with the fit's own drift (default x2, from the backtest) |
+| `make_playoff_charts` | Redraw the playoff charts without re-simulating |
+| `make_team_card BOS` / `--rankings` | One team's card / only the rankings card |
+| `backtest_playoff_odds --report` | Reprint the playoff odds backtest |
 
 ## If you miss a day
 
@@ -139,3 +156,8 @@ py -m src.pipelines.predict_day --replace          # re-predict every game today
 | Odds log | `output/forward/odds_20262027.csv` |
 | Cards | `output/game_summaries/<date>/<away>_at_<home>_<pregame\|postgame>.png` |
 | Active fit | `output/posteriors/active_fit.json` |
+| Closing-line log | `output/forward/log_closing.log` (when Task Scheduler runs it) |
+| Playoff + Cup odds | `output/playoffs/playoff_odds_<date>.csv`, `playoff_odds_history_<season>.csv`, charts |
+| Team cards, rankings | `output/teams/<fit date>/<TEAM>.png`, `rankings.png` |
+| Player / goalie cards | `output/players/<date>/<TEAM>/`, `output/goalies/<date>/<TEAM>/` |
+| Backtests | `output/backtests/` (game backtests, playoff odds backtest, its saved fits in `playoff_cache/`) |
