@@ -26,14 +26,23 @@ from src.models.game_model import outcome_probs
 
 OUTCOMES = ["reg_home", "ot_home", "so_home", "reg_away", "ot_away", "so_away"]
 DEFAULT_TAU = 0.012             # weekly rating step if the fit has none
+TAU_SCALE = 2.0                 # multiplies the fit's weekly step for season simulations (set from
+                                # backtest_playoff_odds --tau-scales; see README v2.8)
 
 
-def current_standings(conn, season: str, teams_info: pd.DataFrame, franchise: dict | None = None) -> pd.DataFrame:
-    """Standings from the season's played regular-season games in the database.
+def current_standings(conn, season: str, teams_info: pd.DataFrame, franchise: dict | None = None,
+                      before=None) -> pd.DataFrame:
+    """Standings from the season's played regular-season games in the database (only games
+    before the date `before`, if given: standings as of that morning).
     Columns: team, gp, w, l, otl, pts, rw, row, gf, ga."""
-    g = pd.read_sql("""SELECT home_team_abbrev AS home, away_team_abbrev AS away, home_score, away_score,
-                              period_type FROM games WHERE game_type = 2 AND season = ?
-                              AND home_score IS NOT NULL AND away_score IS NOT NULL""", conn, params=(int(season),))
+    q = """SELECT home_team_abbrev AS home, away_team_abbrev AS away, home_score, away_score,
+                  period_type FROM games WHERE game_type = 2 AND season = ?
+                  AND home_score IS NOT NULL AND away_score IS NOT NULL"""
+    params = [int(season)]
+    if before is not None:
+        q += " AND game_date < ?"
+        params.append(str(pd.Timestamp(before).date()))
+    g = pd.read_sql(q, conn, params=params)
     franchise = franchise or {}
     g[["home", "away"]] = g[["home", "away"]].replace(franchise)
     rows = {t: dict(team=t, gp=0, w=0, l=0, otl=0, pts=0, rw=0, row=0, gf=0, ga=0) for t in teams_info["team"]}
@@ -62,9 +71,13 @@ def rank_key(pts, rw, row, w, tie):
 
 def simulate_season(draws: dict, teams: list[str], late: dict, remaining: pd.DataFrame,
                     standings: pd.DataFrame, info: pd.DataFrame, gamma: dict, today,
-                    n_sims: int = 10_000, chunk: int = 1000, seed: int = 0, drift: bool = True) -> dict:
+                    n_sims: int = 10_000, chunk: int = 1000, seed: int = 0, drift: bool = True,
+                    tau_scale: float | None = None) -> dict:
     """Simulate the remaining games n_sims times.
 
+    tau_scale: multiplies the weekly drift (default TAU_SCALE): the fit's step size describes
+               week-to-week rating changes within its window; over a season, injuries, trades and
+               coaching changes add more than that (backtest_playoff_odds measures how much).
     remaining: game_id, game_date, home, away, shift_home, shift_away (known log-rate shifts:
                rest / back-to-backs from context_shift; 0 if none)
     standings: current_standings(...); info: team, division, conference; gamma: team -> goalie offset
@@ -85,8 +98,9 @@ def simulate_season(draws: dict, teams: list[str], late: dict, remaining: pd.Dat
     g_a = np.array([gamma.get(t, 0.0) for t in remaining["away"]])
     sh_h = remaining.get("shift_home", pd.Series(0.0, index=remaining.index)).to_numpy(float)
     sh_a = remaining.get("shift_away", pd.Series(0.0, index=remaining.index)).to_numpy(float)
-    tau_o = np.asarray(draws.get("tau_off", np.full(n_draws, DEFAULT_TAU)), float).reshape(-1)
-    tau_d = np.asarray(draws.get("tau_def", np.full(n_draws, DEFAULT_TAU)), float).reshape(-1)
+    k = TAU_SCALE if tau_scale is None else tau_scale
+    tau_o = k * np.asarray(draws.get("tau_off", np.full(n_draws, DEFAULT_TAU)), float).reshape(-1)
+    tau_d = k * np.asarray(draws.get("tau_def", np.full(n_draws, DEFAULT_TAU)), float).reshape(-1)
     base = {k: standings.set_index("team").reindex(T_list)[k].fillna(0).to_numpy() for k in ("pts", "rw", "row", "w", "gp")}
 
     out = {k: [] for k in ("pts", "rw", "row", "w", "off_end", "def_end", "a0", "ah", "rho", "tau_o", "tau_d")}

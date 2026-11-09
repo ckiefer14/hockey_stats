@@ -1454,6 +1454,35 @@ Output: columns p_round2, p_conf_final, p_final, p_cup in playoff_odds_<date>.cs
 card's playoff tile. Not modelled: playoff-specific home ice or scoring (regular-season values used),
 re-seeding (the NHL does not re-seed), injuries during the playoffs.
 
+### v2.8 — Playoff Odds Backtest — RUN (2026-11-08); drift-scale sweep pending
+`src/pipelines/backtest_playoff_odds.py`: were past seasons' playoff and Cup odds, computed only from
+what was known on each date, calibrated? Default: the 3 latest complete seasons x Nov 15, Dec 15,
+Jan 15, Feb 15, Mar 15 (15 checkpoints, about 1-2 hours; resumes).
+- Each checkpoint: the live model (v2.0 + rest + lineup) fit on the 730 days before the date
+  (`backtest.fit_window`), OT / shootout parameters from those games, standings as of that morning
+  (`current_standings(..., before=)`), goalie mix and rest shifts as of the date, 5,000 simulated
+  seasons + playoffs. Baseline "standings only": same simulation, every team (and goalie) equal.
+- Truth: playoff teams and Cup winner from the NHL playoff-bracket feed (falls back to final
+  standings, no Cup); division winners and final points from the database.
+- Report: Brier / log loss of P(playoffs) by checkpoint vs the baseline (paired, 90% range over
+  team-seasons); calibration by bin; final points inside the 90% projected range (target 90%);
+  division winners; the champion's probability on each date (sanity check only: 3 champions).
+What it tests: the rating uncertainty and the weekly drift (tau) over months, which the
+single-game backtest cannot see. If points ranges are too narrow or wide, tau is the lever.
+
+**First results** (2023-24 to 2025-26, 15 checkpoints, drift x1.0):
+- Model beats standings-only at every date (log loss 0.496 vs 0.564 on Nov 15 ... 0.216 vs 0.232 on
+  Mar 15); pooled -0.0296 [-0.0799, +0.0299]: very likely helps, not proven on 96 team-seasons.
+- Too confident, mostly early: final points inside the 90% range 85% in Nov-Dec, 87.5% overall (misses
+  lean low: 7.5% below, 5.0% above); teams under 5% made it 6.9% of the time (predicted 1.0%);
+  40-60% bin made it 38%, 60-80% bin 58%. Division winners: model slightly worse than standings-only.
+- Cup sanity: the champion's mean log score -2.26 (standings-only -2.97, all equal -3.47).
+**Fix under test:** `season_sim.TAU_SCALE` multiplies the fit's weekly drift in season simulations only
+(game predictions unchanged); `playoff_odds --tau-scale` overrides it. The backtest now saves each
+checkpoint's fit and inputs (output/backtests/playoff_cache/) and `--tau-scales 1 1.25 1.5 2`
+re-simulates them at each scale without refitting. Pick the scale with the lowest log loss, preferring
+coverage near 90% when log losses are within about 0.003; then set TAU_SCALE.
+
 ### v2.3 — Other Candidate Improvements
 
 Smaller items already listed under *Open Questions*, gathered here so v2 has one list:

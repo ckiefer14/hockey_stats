@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--sims", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-drift", action="store_true", help="no rating drift over the rest of the season")
+    parser.add_argument("--tau-scale", type=float, default=None,
+                        help=f"multiply the weekly rating drift (default season_sim.TAU_SCALE = {ss.TAU_SCALE})")
     parser.add_argument("--no-check", action="store_true", help="skip the check against the NHL standings feed")
     parser.add_argument("--no-charts", action="store_true", help="skip the PNG charts (make_playoff_charts)")
     args = parser.parse_args()
@@ -149,9 +151,11 @@ def main():
     gamma = {t: goalie_mix(conn, gg, t, day) for t in info["team"]}
     conn.close()
 
-    print(f"Simulating {args.sims:,} seasons{' (no rating drift)' if args.no_drift else ''}...", flush=True)
+    k = ss.TAU_SCALE if args.tau_scale is None else args.tau_scale
+    print(f"Simulating {args.sims:,} seasons" + (" (no rating drift)" if args.no_drift else f" (drift x{k:g})")
+          + "...", flush=True)
     res = ss.simulate_season(draws, teams, late, sched, standings, info.reset_index(drop=True), gamma, day,
-                             n_sims=args.sims, seed=args.seed, drift=not args.no_drift)
+                             n_sims=args.sims, seed=args.seed, drift=not args.no_drift, tau_scale=args.tau_scale)
     try:                                                      # Stanley Cup bracket on top of each season
         ss.simulate_playoffs(res, info.reset_index(drop=True), gamma, late, np.random.default_rng(args.seed + 1),
                              drift=not args.no_drift)
