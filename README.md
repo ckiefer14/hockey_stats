@@ -1454,7 +1454,7 @@ Output: columns p_round2, p_conf_final, p_final, p_cup in playoff_odds_<date>.cs
 card's playoff tile. Not modelled: playoff-specific home ice or scoring (regular-season values used),
 re-seeding (the NHL does not re-seed), injuries during the playoffs.
 
-### v2.8 — Playoff Odds Backtest — RUN (2026-11-08); drift-scale sweep pending
+### v2.8 — Playoff Odds Backtest — DONE (2026-11-09); drift x2 adopted
 `src/pipelines/backtest_playoff_odds.py`: were past seasons' playoff and Cup odds, computed only from
 what was known on each date, calibrated? Default: the 3 latest complete seasons x Nov 15, Dec 15,
 Jan 15, Feb 15, Mar 15 (15 checkpoints, about 1-2 hours; resumes).
@@ -1482,6 +1482,23 @@ single-game backtest cannot see. If points ranges are too narrow or wide, tau is
 checkpoint's fit and inputs (output/backtests/playoff_cache/) and `--tau-scales 1 1.25 1.5 2`
 re-simulates them at each scale without refitting. Pick the scale with the lowest log loss, preferring
 coverage near 90% when log losses are within about 0.003; then set TAU_SCALE.
+
+**Sweep result (2026-11-09)**, 15 checkpoints x 5,000 seasons per scale:
+
+| drift x | log loss | Brier | points inside 90% | inside Nov-Dec | <5%: predicted / made | champion log score |
+|---|---|---|---|---|---|---|
+| 1.00 | 0.3560 | 0.1122 | 87.5% | 85.4% | 1.0% / 6.9% | -2.257 |
+| 1.25 | 0.3557 | 0.1123 | 87.5% | 85.4% | 1.0% / 7.0% | -2.283 |
+| 1.50 | 0.3558 | 0.1123 | 88.1% | 87.0% | 1.0% / 7.0% | -2.297 |
+| 2.00 | 0.3553 | 0.1123 | 89.0% | 88.5% | 1.0% / 6.0% | -2.323 |
+
+Decision: **TAU_SCALE = 2.0** (lowest log loss, though all within luck; coverage closest to 90%).
+Drift barely changes accuracy; it makes the points ranges honest. Game predictions are unaffected.
+Long shots: the under-5% teams that made it were 3 team-seasons (5 rows): MTL 2024-25 (0.6-1.6% at
+three dates; a second-half run to the last wild card at 91 pts), STL 2024-25 (3.9% in Feb; a run after
+a coaching change, 96 pts), WSH 2023-24 (3.8% in Feb, 91 pts). About one was expected. Mild evidence
+at most; drift does not change it (their gap is points already lost). **Recheck after 2026-27** with
+four seasons: if under-5% teams keep making it, look at how the ratings treat bad starts.
 
 ### v2.3 — Other Candidate Improvements
 
