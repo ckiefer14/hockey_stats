@@ -1500,6 +1500,22 @@ a coaching change, 96 pts), WSH 2023-24 (3.8% in Feb, 91 pts). About one was exp
 at most; drift does not change it (their gap is points already lost). **Recheck after 2026-27** with
 four seasons: if under-5% teams keep making it, look at how the ratings treat bad starts.
 
+### v2.9 — Why This Number (Shapley breakdown) — DONE (2026-11-09)
+`src/models/explain.py` (`win_prob_breakdown`), called by `predict_day` for every game; logged as
+`shap_base`, `shap_total`, `shap_home_ice`, `shap_ratings`, `shap_goalies`, `shap_rest`, `shap_lineup`.
+- The scoring rates are a sum of log-scale pieces, each 0 when neutral: home ice (alpha_home), skater
+  ratings (off/def of both teams), goalies (the starters' Phase 3 ratings), rest & travel (every
+  schedule-context term), lineups (kappa x lin). Switching a factor off = its pieces to 0 for both teams.
+- Base = equal teams, average goalies, neutral ice (about 50%; the rest is the late-game model's own
+  OT / shootout home edge). Shapley value = average change in P(home win) when the factor is switched
+  on, over all 120 orders (32 combinations, exact per-draw probabilities, all posterior draws).
+- The five values add up exactly to P(home win) - base; checked to 6 decimals against the logged
+  p_home. Signs checked on a planted game (away back-to-back, tired goalie, weaker lineup -> home).
+- Pregame card: a "Why BOS 56.1%" strip under the context band, from the favourite's side: one tile
+  per factor (points of win chance and which team it helps, with a bar on a shared scale) and the sum
+  line "even game 50.3% +2.1 -1.8 ... = 56.1%". Rows logged before this have no strip.
+This was v2.0c analysis B.
+
 ### v2.3 — Other Candidate Improvements
 
 Smaller items already listed under *Open Questions*, gathered here so v2 has one list:

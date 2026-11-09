@@ -61,6 +61,7 @@ class PregameData:
     note: str = ""                          # free text for the footer
     colors: tuple | None = None             # (home, away); None = team colours
     home_ctx: dict | None = None            # v2 context band (see module docstring)
+    breakdown: dict | None = None           # v2 "why" strip: explain.win_prob_breakdown (base, total, factors)
     away_ctx: dict | None = None
 
 
@@ -502,6 +503,68 @@ def _body(fig, d: PregameData, s: dict):
 
 
 BAND_IN = 2.15                          # extra height (inches) for the v2 context band
+WHY_IN = 1.55                           # extra height for the "why" strip
+WHY_ORDER = ["home_ice", "ratings", "goalies", "rest", "lineup"]
+WHY_LABELS = {"home_ice": "Home ice", "ratings": "Team ratings", "goalies": "Goalies", "rest": "Rest & travel",
+              "lineup": "Lineups"}
+
+
+def _why_strip(fig, d: PregameData, bottom: float, top: float):
+    """Five tiles, one per factor: how many points of win chance it adds, and for which team
+    (from the favourite's side; they add up from the even-game base to tonight's number)."""
+    b = d.breakdown
+    hc, ac = d.colors
+    home_fav = b["total"] >= 0.5
+    fav, other = (d.home, d.away) if home_fav else (d.away, d.home)
+    c_fav, c_oth = (hc, ac) if home_fav else (ac, hc)
+    sign = 1 if home_fav else -1
+    base = b["base"] if home_fav else 1 - b["base"]
+    total = b["total"] if home_fav else 1 - b["total"]
+    vals = [(f, sign * float(b.get(f, 0.0) or 0.0)) for f in WHY_ORDER]
+    vmax = max([abs(v) for _, v in vals] + [0.01])
+
+    cs.card_background(fig, [(0.025, bottom, 0.975, top)])
+    H = fig.get_size_inches()[1]
+    pad = 0.16 / H
+    fig.text(0.045, top - pad, f"Why {fav} {cs.pct(total)}", fontsize=12, fontweight="bold", va="top",
+             color=cs.ink_for(c_fav))
+    terms = "  ".join(f"{100 * v:+.1f}".replace("-", "−") if abs(v) >= 0.0005 else "+0.0" for _, v in vals)
+    fig.text(0.955, top - pad, f"even game {cs.pct(base)}   {terms}   =  {cs.pct(total)}", fontsize=9,
+             color=cs.INK_2, va="top", ha="right")
+
+    n = len(vals)
+    x0, x1, gap = 0.045, 0.955, 0.012
+    tw = (x1 - x0 - gap * (n - 1)) / n
+    t_top = top - 0.46 / H
+    t_bot = bottom + 0.14 / H
+    th = t_top - t_bot
+    for i, (f, v) in enumerate(vals):
+        tx = x0 + i * (tw + gap)
+        fig.patches.append(Rectangle((tx, t_bot), tw, th, transform=fig.transFigure, facecolor=cs.PAGE,
+                                     edgecolor="none", zorder=-5))
+        fig.text(tx + 0.01, t_top - 0.07 / H, WHY_LABELS[f], fontsize=8.5, color=cs.INK_2, va="top")
+        tiny = abs(v) < 0.0005
+        team = None if tiny else (fav if v > 0 else other)
+        col = cs.MUTED if tiny else (c_fav if v > 0 else c_oth)
+        fig.text(tx + 0.01, t_bot + th * 0.47, "0.0" if tiny else f"{100 * v:+.1f}".replace("-", "−"),
+                 fontsize=15, fontweight="bold", color=cs.INK, va="center")
+        if team:
+            fig.text(tx + tw - 0.01, t_bot + th * 0.47, f"pts {team}", fontsize=9, fontweight="bold",
+                     color=cs.ink_for(col), va="center", ha="right")
+        # mini bar on a shared scale, centred: right = helps the favourite, left = helps the other team
+        bx0, bx1, by = tx + 0.01, tx + tw - 0.01, t_bot + th * 0.16
+        mid = (bx0 + bx1) / 2
+        fig.add_artist(matplotlib_hline(bx0, bx1, by, cs.GRID, 1.0))
+        fig.add_artist(matplotlib_line(mid, by - 0.05 / H, by + 0.05 / H))
+        if not tiny:
+            L = (bx1 - bx0) / 2 * abs(v) / vmax
+            fig.patches.append(Rectangle((mid if v > 0 else mid - L, by - 0.035 / H), L, 0.07 / H,
+                                         transform=fig.transFigure, facecolor=col, edgecolor="none", zorder=3))
+
+
+def matplotlib_hline(x0, x1, y, color, lw):
+    from matplotlib.lines import Line2D
+    return Line2D([x0, x1], [y, y], color=color, lw=lw)
 
 
 def plot_pregame_card(d: PregameData):
@@ -515,14 +578,20 @@ def plot_pregame_card(d: PregameData):
         _body(fig, d, s)
         return fig
 
-    H = 11 + BAND_IN
+    why = WHY_IN if d.breakdown else 0.0
+    extra = BAND_IN + why
+    H = 11 + extra
     k = 11 / H
     fig = cs.new_figure(12, H)
     # the old 11-inch body, unchanged, in the bottom 11 inches (its header area stays empty)
-    body = fig.subfigures(2, 1, height_ratios=[BAND_IN, 11], hspace=0, facecolor="none")[1]
+    body = fig.subfigures(2, 1, height_ratios=[extra, 11], hspace=0, facecolor="none")[1]
     _header(fig, d, top=1 - 0.035 * k, k=k)
+    gap = 0.165
+    why_bottom_in = 0.895 * 11 + gap                      # inches from the bottom
+    band_bottom_in = why_bottom_in + (why - gap if why else 0.0) + (gap if why else 0.0)
     band_top = 1 - 1.2 / H
-    band_bottom = (0.895 * 11 + 0.165) / H                # 0.165 in above the hero panel
-    _context_band(fig, d, band_top, band_bottom, k)
+    _context_band(fig, d, band_top, band_bottom_in / H, k)
+    if why:
+        _why_strip(fig, d, why_bottom_in / H, (why_bottom_in + why - gap) / H)
     _body(body, d, s)
     return fig

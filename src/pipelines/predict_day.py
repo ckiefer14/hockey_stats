@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import OUTPUT_DIR
+from src.models.explain import win_prob_breakdown
 from src.data.db import get_connection
 from src.processing.goalie import goalie_game_xg
 from src.processing.late_game import load_params
@@ -179,6 +180,12 @@ def predict_one(row, draws, teams, late, ss, ratings, conn, goalies, score_sims,
     capped = np.minimum(total, TOTAL_MAX)
     for k in range(TOTAL_MAX + 1):
         out[f"p_total_{k}"] = float((capped == k).mean())
+    # why this probability: Shapley breakdown into home ice, ratings, goalies, rest, lineups (explain.py)
+    try:
+        br = win_prob_breakdown(draws, teams, late, home, away, gamma["home"], gamma["away"], ctx)
+        out.update({f"shap_{k}": v for k, v in br.items()})
+    except Exception as e:                                  # noqa: BLE001  never block a prediction
+        print(f"    breakdown skipped for {away} @ {home}: {type(e).__name__}: {e}")
     return out, res, sims
 
 

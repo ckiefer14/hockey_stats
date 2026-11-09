@@ -127,6 +127,15 @@ def _get(row, key):
     return None if v is None or (isinstance(v, float) and np.isnan(v)) else v
 
 
+def breakdown_from(row) -> dict | None:
+    """The logged Shapley breakdown (shap_* columns from predict_day), or None for older rows."""
+    keys = ("base", "total", "home_ice", "ratings", "goalies", "rest", "lineup")
+    vals = {k: _get(row, f"shap_{k}") for k in keys}
+    if vals["base"] is None or vals["total"] is None:
+        return None
+    return {k: float(v or 0.0) for k, v in vals.items()}
+
+
 def pregame_context(row, side: str, odds: pd.DataFrame | None, odds_date: str | None) -> dict | None:
     """The v2 context band for one team from a logged prediction (None for old rows without it)."""
     from src.processing.schedule_context import FRANCHISE
@@ -194,7 +203,7 @@ def pregame_card(row, res: dict, sims: pd.DataFrame, conn) -> Path:
     )
     odds, odds_date = playoff_odds_on(date)
     data = replace(data, home_ctx=pregame_context(row, "home", odds, odds_date),
-                   away_ctx=pregame_context(row, "away", odds, odds_date))
+                   away_ctx=pregame_context(row, "away", odds, odds_date), breakdown=breakdown_from(row))
     return _save(plot_pregame_card(data), card_path(date, home, away, "pregame"))
 
 
